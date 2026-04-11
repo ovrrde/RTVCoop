@@ -1,0 +1,8 @@
+[mod]
+name="RTV Coop"
+id="rtv-coop"
+version="1.0.0"
+priority=10
+
+[autoload]
+RTVCoopMain="res://mods/RTVCoop/Main.gd"
