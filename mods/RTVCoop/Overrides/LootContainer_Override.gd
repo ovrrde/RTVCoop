@@ -21,15 +21,21 @@ func _ready():
         if seed_val != 0:
             seed(seed_val)
 
+    var loot_mult_f: float = 1.0
+    if is_coop:
+        var pm = _pm()
+        if pm:
+            loot_mult_f = pm.GetSetting("loot_multiplier", 1.0)
+
     if !custom && !locked && !furniture:
         ClearBuckets()
         FillBuckets()
-        GenerateLoot()
+        _generate_loot_scaled(loot_mult_f)
 
     if custom && !force:
         ClearBuckets()
         FillBucketsCustom()
-        GenerateLoot()
+        _generate_loot_scaled(loot_mult_f)
 
     if custom && force:
         for index in custom.items.size():
@@ -42,6 +48,15 @@ func _ready():
 
     if is_coop:
         randomize()
+
+
+func _generate_loot_scaled(mult: float):
+    var full_passes: int = int(mult)
+    var frac: float = mult - float(full_passes)
+    for _i in full_passes:
+        GenerateLoot()
+    if frac > 0.0 and randf() < frac:
+        GenerateLoot()
 
 
 func Interact():

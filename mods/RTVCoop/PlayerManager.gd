@@ -40,6 +40,29 @@ const PICKUP_LERP_SPEED: float = 18.0
 # mixed into loot seeding so containers vary per session but host/client agree within one
 var coopSessionSeed: int = 0
 
+var coopSettings: Dictionary = {
+    "loot_multiplier": 1.0,
+    "stats_drain_multiplier": 1.0,
+    "ai_multiplier": 1.0,
+    "day_rate_multiplier": 1.0,
+    "night_rate_multiplier": 1.0,
+}
+
+
+func GetSetting(key: String, fallback: float = 1.0) -> float:
+    return float(coopSettings.get(key, fallback))
+
+
+func SetSetting(key: String, value: float):
+    coopSettings[key] = value
+    if multiplayer.is_server() and _net() and _net().IsActive():
+        BroadcastCoopSettings.rpc(coopSettings)
+
+
+@rpc("authority", "reliable", "call_remote")
+func BroadcastCoopSettings(settings: Dictionary):
+    coopSettings = settings.duplicate()
+
 
 func _ready():
     _net().disconnected.connect(_on_disconnected)
@@ -166,6 +189,7 @@ func _on_disconnected():
         _container_sync()._container_holders.clear()
     coopCharacterBuffer = null
     coopSessionSeed = 0
+    coopSettings = {"loot_multiplier": 1.0, "stats_drain_multiplier": 1.0, "ai_multiplier": 1.0, "day_rate_multiplier": 1.0, "night_rate_multiplier": 1.0}
     sceneReady = false
     pendingSceneChange = ""
     pendingSpawnPosition = Vector3.ZERO
@@ -223,6 +247,7 @@ func _on_peer_joined_for_names(_id: int):
     await get_tree().create_timer(0.5, false).timeout
     SyncNameRegistry.rpc(peer_names)
     DeliverSessionSeed.rpc_id(_id, coopSessionSeed)
+    BroadcastCoopSettings.rpc_id(_id, coopSettings)
     if _quest_sync():
         _quest_sync().push_full_state_to(_id)
 
@@ -252,6 +277,9 @@ func _on_peer_left_for_names(id: int):
         es._sleep_ready.erase(id)
         var total: int = 1 + _net().GetPeerIds().size()
         es.BroadcastSleepStatus.rpc(es._sleep_ready.keys(), total)
+    var fs = _furniture_sync()
+    if fs:
+        fs.ReleaseLockForPeer(id)
 
 
 @rpc("any_peer", "call_remote", "reliable")

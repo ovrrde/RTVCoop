@@ -18,6 +18,8 @@ const _NET_SYNC_INTERVAL: float = 1.0 / 20.0
 
 func _physics_process(delta):
     if gameData.isPlacing and (placable == null or !is_instance_valid(placable)):
+        if _net_last_furniture_fid >= 0:
+            _coop_release_furniture_lock(_net_last_furniture_fid)
         placable = null
         furniture = null
         initialWait = false
@@ -40,6 +42,7 @@ func _input(event):
             fid = int(placable.get_meta("coop_furniture_id"))
         super(event)
         if fid >= 0:
+            _coop_release_furniture_lock(fid)
             if multiplayer.is_server():
                 _pm()._furniture_sync().BroadcastFurnitureRemove.rpc(fid)
             else:
@@ -67,6 +70,7 @@ func _coop_sync_placable(delta: float):
         _net_sync_accumulator = 0.0
     if _net_last_furniture_fid >= 0:
         _coop_finalize_furniture_sync()
+        _coop_release_furniture_lock(_net_last_furniture_fid)
         _net_last_furniture_fid = -1
         _net_sync_accumulator = 0.0
 
@@ -126,3 +130,18 @@ func _coop_finalize_furniture_sync():
         fs.BroadcastFurnitureMove.rpc(_net_last_furniture_fid, final_root.global_position, final_root.global_rotation, final_root.scale)
     else:
         fs.SubmitFurnitureMove.rpc_id(1, _net_last_furniture_fid, final_root.global_position, final_root.global_rotation, final_root.scale)
+
+
+func _coop_release_furniture_lock(fid: int):
+    if fid < 0:
+        return
+    var pm = _pm()
+    if !pm:
+        return
+    var fs = pm._furniture_sync()
+    if !fs:
+        return
+    if multiplayer.is_server():
+        fs.HostUnlockFurniture(fid)
+    else:
+        fs.RequestFurnitureUnlock.rpc_id(1, fid)

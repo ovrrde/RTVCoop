@@ -34,7 +34,10 @@ func _physics_process(_delta):
 
 
             if target.is_in_group("Interactable") && !gameData.decor:
-                target.owner.UpdateTooltip()
+                if _net() and _net().IsActive() and target.owner.get("canSleep") != null:
+                    _coop_bed_tooltip(target.owner)
+                else:
+                    target.owner.UpdateTooltip()
                 gameData.interaction = true
 
 
@@ -70,6 +73,9 @@ func Interact():
     if Input.is_action_just_pressed(("interact")):
 
         if !gameData.decor && target.is_in_group("Interactable"):
+            if _net() and _net().IsActive() and target.owner.get("canSleep") != null:
+                _coop_bed_interact(target.owner)
+                return
             target.owner.Interact()
 
         elif !gameData.decor && target.is_in_group("Transition"):
@@ -95,6 +101,45 @@ func Interact():
                 target.Interact()
 
         if gameData.decor && target.is_in_group("Furniture"):
+            if _net() and _net().IsActive():
+                var root = target.owner
+                if root and root.has_meta("coop_furniture_id"):
+                    var fid = int(root.get_meta("coop_furniture_id"))
+                    var fs = _pm()._furniture_sync() if _pm() else null
+                    if fs and fs.IsFurnitureLocked(fid):
+                        var locker_id = fs.GetFurnitureLockOwner(fid)
+                        var locker_name = _pm().GetPlayerName(locker_id) if _pm() else str(locker_id)
+                        Loader.Message("In use by " + locker_name, Color.ORANGE)
+                        return
+                    if fs:
+                        if multiplayer.is_server():
+                            fs.HostLockFurniture(fid)
+                        else:
+                            fs.RequestFurnitureLock.rpc_id(1, fid)
             for child in target.owner.get_children():
                 if child is Furniture:
                     child.Catalog()
+
+
+func _coop_bed_interact(bed: Node):
+    if !bed.canSleep:
+        return
+    var es = _pm()._event_sync()
+    if !es:
+        return
+    if multiplayer.is_server():
+        es.HostToggleSleepReady(multiplayer.get_unique_id(), bed.randomSleep)
+    else:
+        es.RequestSleepReady.rpc_id(1, bed.randomSleep)
+
+
+func _coop_bed_tooltip(bed: Node):
+    if !bed.canSleep:
+        gameData.tooltip = ""
+        return
+    var es = _pm()._event_sync()
+    var my_id = multiplayer.get_unique_id()
+    if es and es._sleep_ready.has(my_id):
+        gameData.tooltip = "Sleep [Cancel]"
+    else:
+        gameData.tooltip = "Sleep (Random: 6-12h) [Ready]"

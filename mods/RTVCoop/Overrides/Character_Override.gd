@@ -148,4 +148,23 @@ func CoopRespawn():
 
     _pm().NotifyPlayerRespawn(multiplayer.get_unique_id())
 
-    print("DEATH: Coop Respawn at " + str(respawnPos))
+
+func _physics_process(delta):
+    var pm = _pm()
+    var apply_mult: bool = pm and _net() and _net().IsActive()
+    var energy_before: float = gameData.energy
+    var hydration_before: float = gameData.hydration
+    var mental_before: float = gameData.mental
+    super(delta)
+    if apply_mult:
+        var mult: float = pm.GetSetting("stats_drain_multiplier", 1.0)
+        if mult != 1.0:
+            var energy_drain: float = energy_before - gameData.energy
+            if energy_drain > 0:
+                gameData.energy = energy_before - energy_drain * mult
+            var hydration_drain: float = hydration_before - gameData.hydration
+            if hydration_drain > 0:
+                gameData.hydration = hydration_before - hydration_drain * mult
+            var mental_drain: float = mental_before - gameData.mental
+            if mental_drain > 0:
+                gameData.mental = mental_before - mental_drain * mult

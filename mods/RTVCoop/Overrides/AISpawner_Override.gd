@@ -11,6 +11,12 @@ func _pm():
 
 
 func _ready():
+    if _net() and _net().IsActive() and multiplayer.is_server():
+        var pm = _pm()
+        if pm:
+            var ai_mult: float = pm.GetSetting("ai_multiplier", 1.0)
+            if ai_mult != 1.0:
+                spawnPool = max(0, roundi(float(spawnPool) * ai_mult))
     super()
 
 

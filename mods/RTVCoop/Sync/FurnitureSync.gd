@@ -8,6 +8,76 @@ var _move_targets: Dictionary = {}
 const FURNITURE_LERP_SPEED: float = 18.0
 const FURNITURE_LERP_EPSILON: float = 0.01
 
+# fid -> peer_id; tracks which peer is actively editing each piece
+var _editing_locks: Dictionary = {}
+
+
+func IsFurnitureLocked(fid: int) -> bool:
+    return _editing_locks.has(fid)
+
+
+func GetFurnitureLockOwner(fid: int) -> int:
+    return int(_editing_locks.get(fid, 0))
+
+
+@rpc("any_peer", "reliable", "call_remote")
+func RequestFurnitureLock(fid: int):
+    if !multiplayer.is_server():
+        return
+    var sender = multiplayer.get_remote_sender_id()
+    if _editing_locks.has(fid):
+        DenyFurnitureLock.rpc_id(sender, fid)
+        return
+    _editing_locks[fid] = sender
+    BroadcastFurnitureLock.rpc(fid, sender)
+
+
+func HostLockFurniture(fid: int):
+    if _editing_locks.has(fid):
+        return
+    _editing_locks[fid] = 1
+    BroadcastFurnitureLock.rpc(fid, 1)
+
+
+@rpc("authority", "reliable", "call_local")
+func BroadcastFurnitureLock(fid: int, peer_id: int):
+    _editing_locks[fid] = peer_id
+
+
+@rpc("authority", "reliable", "call_remote")
+func DenyFurnitureLock(fid: int):
+    pass
+
+
+@rpc("any_peer", "reliable", "call_remote")
+func RequestFurnitureUnlock(fid: int):
+    if !multiplayer.is_server():
+        return
+    var sender = multiplayer.get_remote_sender_id()
+    if _editing_locks.get(fid, -1) == sender:
+        _editing_locks.erase(fid)
+        BroadcastFurnitureUnlock.rpc(fid)
+
+
+func HostUnlockFurniture(fid: int):
+    _editing_locks.erase(fid)
+    BroadcastFurnitureUnlock.rpc(fid)
+
+
+@rpc("authority", "reliable", "call_local")
+func BroadcastFurnitureUnlock(fid: int):
+    _editing_locks.erase(fid)
+
+
+func ReleaseLockForPeer(peer_id: int):
+    var to_release: Array = []
+    for fid in _editing_locks:
+        if int(_editing_locks[fid]) == peer_id:
+            to_release.append(fid)
+    for fid in to_release:
+        _editing_locks.erase(fid)
+        BroadcastFurnitureUnlock.rpc(fid)
+
 
 func _physics_process(delta):
     if _move_targets.is_empty():
