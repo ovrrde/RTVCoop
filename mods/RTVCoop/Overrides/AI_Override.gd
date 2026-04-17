@@ -16,6 +16,8 @@ var spawnVariant: Dictionary = {}
 var _client_anim_ready: bool = false
 var _client_last_state: int = -1
 
+var _coop_force_local_play: bool = false
+
 
 func _physics_process(delta):
     if pause || dead:
@@ -117,7 +119,6 @@ func Initialize():
     DeactivateContainer()
     HideGizmos()
 
-    # Clients skip the sensor warmup — state machine runs server-only.
     if _net().IsActive() and !multiplayer.is_server():
         return
 
@@ -183,8 +184,15 @@ func Sensor(delta):
 
 func SelectWeapon():
     if weapons.get_child_count() != 0:
-        var weaponIndex = spawnVariant.get("weaponIndex", -1)
-        if weaponIndex < 0 || weaponIndex >= weapons.get_child_count():
+        var weaponFile: String = spawnVariant.get("weaponFile", "")
+        var weaponIndex = -1
+        if weaponFile != "":
+            for i in weapons.get_child_count():
+                var child = weapons.get_child(i)
+                if child.slotData and child.slotData.itemData and child.slotData.itemData.file == weaponFile:
+                    weaponIndex = i
+                    break
+        if weaponIndex < 0:
             weaponIndex = randi_range(0, weapons.get_child_count() - 1)
 
         weapon = weapons.get_child(weaponIndex)
@@ -240,8 +248,18 @@ func SelectBackpack():
     if backpacks.get_child_count() != 0:
         var backpackRoll = spawnVariant.get("backpackRoll", randi_range(0, 100))
         if backpackRoll < 10:
-            var backpackIndex = spawnVariant.get("backpackIndex", -1)
-            if backpackIndex < 0 || backpackIndex >= backpacks.get_child_count():
+            var backpackFile: String = spawnVariant.get("backpackFile", "")
+            var backpackIndex = -1
+            if backpackFile != "":
+                for i in backpacks.get_child_count():
+                    var child = backpacks.get_child(i)
+                    if child.get("slotData") and child.slotData.itemData and child.slotData.itemData.file == backpackFile:
+                        backpackIndex = i
+                        break
+                    if backpackIndex < 0 and child.name == backpackFile:
+                        backpackIndex = i
+                        break
+            if backpackIndex < 0:
                 backpackIndex = randi_range(0, backpacks.get_child_count() - 1)
             backpack = backpacks.get_child(backpackIndex)
 
@@ -266,8 +284,14 @@ func SelectBackpack():
 
 func SelectClothing():
     if clothing.size() != 0:
-        var clothingIndex = spawnVariant.get("clothingIndex", -1)
-        if clothingIndex < 0 || clothingIndex >= clothing.size():
+        var clothingPath: String = spawnVariant.get("clothingPath", "")
+        var clothingIndex = -1
+        if clothingPath != "":
+            for i in clothing.size():
+                if clothing[i] and clothing[i].resource_path == clothingPath:
+                    clothingIndex = i
+                    break
+        if clothingIndex < 0:
             clothingIndex = randi_range(0, clothing.size() - 1)
         var clothingMaterial = clothing[clothingIndex]
         mesh.set_surface_override_material(0, clothingMaterial)
@@ -299,6 +323,29 @@ func ActivateBoss():
     HideGizmos()
 
 
+func _coop_sound(sound_type: int, extra_bool: bool = false):
+    if _coop_force_local_play:
+        return true
+    if _net().IsActive() and !multiplayer.is_server():
+        return false
+    if _net().IsActive() and multiplayer.is_server() and has_meta("network_uuid"):
+        _pm()._ai_sync().BroadcastAISound.rpc(get_meta("network_uuid"), sound_type, extra_bool)
+    return true
+
+func PlayFire():
+    if _coop_sound(0, fullAuto): super()
+func PlayTail():
+    if _coop_sound(1): super()
+func PlayIdle():
+    if _coop_sound(2): super()
+func PlayCombat():
+    if _coop_sound(3): super()
+func PlayDamage():
+    if _coop_sound(4): super()
+func PlayDeath():
+    if _coop_sound(5): super()
+
+
 func WeaponDamage(hitbox: String, damage: float):
     if dead:
         return
@@ -314,7 +361,7 @@ func WeaponDamage(hitbox: String, damage: float):
 
     if _net().IsActive() && !multiplayer.is_server():
         if has_meta("network_uuid"):
-            _pm().RequestAIDamage.rpc_id(1, get_meta("network_uuid"), hitbox, damage)
+            _pm()._ai_sync().RequestAIDamage.rpc_id(1, get_meta("network_uuid"), hitbox, damage)
         return
 
     super(hitbox, damage)
@@ -328,15 +375,10 @@ func Death(direction, force):
         return
 
     if _net().IsActive() && multiplayer.is_server() && has_meta("network_uuid"):
-        # Snapshot the AI's loot so clients don't need path-based lazy sync
-        # for the corpse container. Also captures host-authoritative ammo
-        # counts on the dropped weapon.
         var container_loot: Array = []
-        if container and container.get_child_count() > 0:
-            var ai_container = container.get_child(0)
-            if ai_container and ai_container is LootContainer:
-                for slot in ai_container.loot:
-                    container_loot.append(_pm().SerializeSlotData(slot))
+        if container and container is LootContainer:
+            for slot in container.loot:
+                container_loot.append(_pm().SerializeSlotData(slot))
 
         var weapon_dict: Dictionary = {}
         if weapon and weapon.slotData:
@@ -350,8 +392,9 @@ func Death(direction, force):
         if secondary and secondary.slotData:
             secondary_dict = _pm().SerializeSlotData(secondary.slotData)
 
-        _pm().BroadcastAIDeath.rpc(
-            get_meta("network_uuid"),
+        var dying_uuid = get_meta("network_uuid")
+        _pm()._ai_sync().BroadcastAIDeath.rpc(
+            dying_uuid,
             direction,
             force,
             container_loot,
@@ -359,6 +402,9 @@ func Death(direction, force):
             backpack_dict,
             secondary_dict
         )
+        # BroadcastAIDeath is call_remote so host must erase locally
+        _pm().worldAI.erase(dying_uuid)
+        _pm().aiTargets.erase(dying_uuid)
 
     var aiUuid = get_meta("network_uuid") if has_meta("network_uuid") else -1
 
@@ -373,6 +419,11 @@ func Death(direction, force):
     collision.disabled = true
     agent.velocity = Vector3.ZERO
     ActivateContainer()
+
+    if aiUuid >= 0 and container and container is LootContainer:
+        if !container.is_in_group("CoopLootContainer"):
+            container.add_to_group("CoopLootContainer")
+        container.set_meta("coop_container_id", aiUuid)
 
     if weapon:
         weapon.collision.disabled = false

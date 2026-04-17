@@ -10,23 +10,34 @@ func _pm():
     return _pm_c
 
 
+func _ready():
+    var s: int = 0
+    if _net() and _net().IsActive():
+        s = await _pm().CoopSeedForNode(self)
+        if s != 0:
+            seed(s)
+    super()
+    if s != 0:
+        randomize()
+
+
 func Interact():
     if _net().IsActive() && !multiplayer.is_server():
         if key && locked:
             CheckKey()
             if locked:
                 return
-            _pm().RequestDoorUnlock.rpc_id(1, get_path())
+            _pm()._interactable_sync().RequestDoorUnlock.rpc_id(1, get_path())
             return
         if isOccupied:
             return
-        _pm().RequestDoorToggle.rpc_id(1, get_path())
+        _pm()._interactable_sync().RequestDoorToggle.rpc_id(1, get_path())
         return
 
     if key && locked:
         CheckKey()
         if !locked && _net().IsActive() && multiplayer.is_server():
-            _pm().BroadcastDoorUnlock.rpc(get_path())
+            _pm()._interactable_sync().BroadcastDoorUnlock.rpc(get_path())
         return
 
     if isOccupied:
@@ -36,7 +47,7 @@ func Interact():
     ApplyDoorState(newOpen)
 
     if _net().IsActive() && multiplayer.is_server():
-        _pm().BroadcastDoorState.rpc(get_path(), newOpen)
+        _pm()._interactable_sync().BroadcastDoorState.rpc(get_path(), newOpen)
 
 
 func ApplyDoorState(newOpen: bool):

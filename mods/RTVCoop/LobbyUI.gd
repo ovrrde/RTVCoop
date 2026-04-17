@@ -7,14 +7,18 @@ var fontSemiBold = load("res://Fonts/Lora-SemiBold.ttf")
 var coopButton: Button = null
 var coopPanel: Control = null
 var menuMain: Control = null
-var statusLabel: RichTextLabel
+
 var steamLabel: RichTextLabel
-var directIpLabel: RichTextLabel
-var ipInput: LineEdit
+var statusLabel: RichTextLabel
+var playersLabel: RichTextLabel
 var hostBtn: Button
-var joinBtn: Button
 var inviteBtn: Button
 var dcBtn: Button
+
+var continueBtn: Button
+var newGameBtn: Button
+var waitingLabel: RichTextLabel
+
 var injected: bool = false
 var steam_signals_hooked: bool = false
 
@@ -27,6 +31,10 @@ func _net():
 
 func _steam_lobby():
     return get_tree().root.get_node_or_null("SteamLobby")
+
+
+func _pm():
+    return get_tree().root.get_node_or_null("PlayerManager")
 
 
 func _ready():
@@ -43,10 +51,8 @@ func _process(_delta):
     if scene.name != "Map":
         if !injected:
             _try_inject(scene)
-        if coopPanel:
+        if coopPanel and coopPanel.visible:
             _update_status()
-        if coopPanel:
-            coopPanel.visible = coopPanel.visible  # keep as-is
     else:
         if coopPanel:
             coopPanel.hide()
@@ -113,96 +119,104 @@ func _create_panel(scene: Node):
     coopPanel.hide()
     scene.add_child(coopPanel)
 
-    var center = VBoxContainer.new()
-    center.anchor_left = 0.5
-    center.anchor_right = 0.5
-    center.anchor_top = 0.35
-    center.anchor_bottom = 0.7
-    center.offset_left = -160
-    center.offset_right = 160
-    center.offset_top = -80
-    center.offset_bottom = 80
-    center.grow_horizontal = Control.GROW_DIRECTION_BOTH
-    center.grow_vertical = Control.GROW_DIRECTION_BOTH
-    center.add_theme_constant_override("separation", 8)
-    coopPanel.add_child(center)
-
     var buttons = scene.get_node_or_null("Main/Buttons")
-    var templateBtn = buttons.get_child(0) if buttons && buttons.get_child_count() > 0 else null
+    var templateBtn = buttons.get_child(0) if buttons and buttons.get_child_count() > 0 else null
 
-    steamLabel = RichTextLabel.new()
-    steamLabel.bbcode_enabled = true
-    steamLabel.fit_content = true
-    steamLabel.scroll_active = false
-    steamLabel.add_theme_font_override("normal_font", fontMedium)
-    steamLabel.add_theme_font_size_override("normal_font_size", 13)
-    steamLabel.text = "[center][color=gray]Steam: checking...[/color][/center]"
-    center.add_child(steamLabel)
-
-    statusLabel = RichTextLabel.new()
-    statusLabel.bbcode_enabled = true
-    statusLabel.fit_content = true
-    statusLabel.scroll_active = false
-    statusLabel.add_theme_font_override("normal_font", fontMedium)
-    statusLabel.add_theme_font_size_override("normal_font_size", 16)
-    statusLabel.text = "[center]Disconnected[/center]"
-    center.add_child(statusLabel)
-
-    center.add_child(_spacer(4))
-
-    directIpLabel = RichTextLabel.new()
-    directIpLabel.bbcode_enabled = true
-    directIpLabel.fit_content = true
-    directIpLabel.scroll_active = false
-    directIpLabel.add_theme_font_override("normal_font", fontMedium)
-    directIpLabel.add_theme_font_size_override("normal_font_size", 11)
-    directIpLabel.text = "[center][color=gray]Direct IP[/color][/center]"
-    center.add_child(directIpLabel)
-
-    ipInput = LineEdit.new()
-    ipInput.placeholder_text = "Enter IP Address"
-    ipInput.text = "127.0.0.1"
-    ipInput.alignment = HORIZONTAL_ALIGNMENT_CENTER
-    ipInput.add_theme_font_override("font", fontMedium)
-    ipInput.add_theme_font_size_override("font_size", 16)
-    ipInput.add_theme_color_override("font_color", Color(0.9, 0.9, 0.9))
-    ipInput.add_theme_color_override("font_placeholder_color", Color(0.4, 0.4, 0.4))
-    var ipStyle = StyleBoxFlat.new()
-    ipStyle.bg_color = Color(0.06, 0.06, 0.06, 0.9)
-    ipStyle.border_color = Color(0.2, 0.2, 0.2, 0.8)
-    ipStyle.set_border_width_all(1)
-    ipStyle.set_corner_radius_all(2)
-    ipStyle.content_margin_left = 12
-    ipStyle.content_margin_right = 12
-    ipStyle.content_margin_top = 8
-    ipStyle.content_margin_bottom = 8
-    ipInput.add_theme_stylebox_override("normal", ipStyle)
-    ipInput.add_theme_stylebox_override("focus", ipStyle)
-    center.add_child(ipInput)
-
-    center.add_child(_spacer(4))
+    var buttonColumn = VBoxContainer.new()
+    buttonColumn.anchor_left = 0.5
+    buttonColumn.anchor_right = 0.5
+    buttonColumn.anchor_top = 0.5
+    buttonColumn.anchor_bottom = 0.5
+    buttonColumn.offset_left = -160
+    buttonColumn.offset_right = 160
+    buttonColumn.offset_top = -150
+    buttonColumn.offset_bottom = 150
+    buttonColumn.grow_horizontal = Control.GROW_DIRECTION_BOTH
+    buttonColumn.grow_vertical = Control.GROW_DIRECTION_BOTH
+    buttonColumn.add_theme_constant_override("separation", 6)
+    coopPanel.add_child(buttonColumn)
 
     hostBtn = _clone_menu_btn(templateBtn, "Host Game")
     hostBtn.pressed.connect(_on_host)
-    center.add_child(hostBtn)
-
-    joinBtn = _clone_menu_btn(templateBtn, "Join Game")
-    joinBtn.pressed.connect(_on_join)
-    center.add_child(joinBtn)
+    buttonColumn.add_child(hostBtn)
 
     inviteBtn = _clone_menu_btn(templateBtn, "Invite Friend")
     inviteBtn.pressed.connect(_on_invite)
-    center.add_child(inviteBtn)
+    buttonColumn.add_child(inviteBtn)
 
     dcBtn = _clone_menu_btn(templateBtn, "Disconnect")
     dcBtn.pressed.connect(_on_dc)
-    center.add_child(dcBtn)
+    buttonColumn.add_child(dcBtn)
 
-    center.add_child(_spacer(2))
+    buttonColumn.add_child(_divider())
+
+    continueBtn = _clone_menu_btn(templateBtn, "Continue")
+    continueBtn.pressed.connect(_on_continue)
+    buttonColumn.add_child(continueBtn)
+
+    newGameBtn = _clone_menu_btn(templateBtn, "New Game")
+    newGameBtn.pressed.connect(_on_new_game)
+    buttonColumn.add_child(newGameBtn)
+
+    waitingLabel = _make_label(13, "[center][color=#e0c850]Waiting for host to start the game...[/color][/center]")
+    waitingLabel.visible = false
+    buttonColumn.add_child(waitingLabel)
+
+    buttonColumn.add_child(_divider())
 
     var returnBtn = _clone_menu_btn(templateBtn, "Return")
     returnBtn.pressed.connect(_on_return)
-    center.add_child(returnBtn)
+    buttonColumn.add_child(returnBtn)
+
+    # Right-side info column (status + player list)
+    var infoColumn = VBoxContainer.new()
+    infoColumn.anchor_left = 1.0
+    infoColumn.anchor_right = 1.0
+    infoColumn.anchor_top = 0.5
+    infoColumn.anchor_bottom = 0.5
+    infoColumn.offset_left = -320
+    infoColumn.offset_right = -40
+    infoColumn.offset_top = -150
+    infoColumn.offset_bottom = 150
+    infoColumn.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+    infoColumn.grow_vertical = Control.GROW_DIRECTION_BOTH
+    infoColumn.add_theme_constant_override("separation", 6)
+    coopPanel.add_child(infoColumn)
+
+    steamLabel = _make_label(13, "[right][color=gray]Steam: checking...[/color][/right]")
+    steamLabel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    infoColumn.add_child(steamLabel)
+
+    statusLabel = _make_label(16, "[right]Disconnected[/right]")
+    statusLabel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    infoColumn.add_child(statusLabel)
+
+    infoColumn.add_child(_divider())
+
+    var playersHeader = _make_label(11, "[right][color=gray]PLAYERS[/color][/right]")
+    playersHeader.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    infoColumn.add_child(playersHeader)
+
+    playersLabel = _make_label(13, "[right][color=gray]Not connected[/color][/right]")
+    playersLabel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    infoColumn.add_child(playersLabel)
+
+
+func _make_label(size: int, text: String) -> RichTextLabel:
+    var lbl = RichTextLabel.new()
+    lbl.bbcode_enabled = true
+    lbl.fit_content = true
+    lbl.scroll_active = false
+    lbl.add_theme_font_override("normal_font", fontMedium)
+    lbl.add_theme_font_size_override("normal_font_size", size)
+    lbl.text = text
+    return lbl
+
+
+func _divider() -> Control:
+    var s = Control.new()
+    s.custom_minimum_size = Vector2(0, 6)
+    return s
 
 
 func _clone_menu_btn(templateBtn, text: String) -> Button:
@@ -214,8 +228,7 @@ func _clone_menu_btn(templateBtn, text: String) -> Button:
                 if btn.is_connected(sig.name, conn.callable):
                     btn.disconnect(sig.name, conn.callable)
         return btn
-    else:
-        return _make_btn(text)
+    return _make_btn(text)
 
 
 func _make_btn(text: String) -> Button:
@@ -249,73 +262,82 @@ func _make_btn(text: String) -> Button:
     return btn
 
 
-func _spacer(h: float) -> Control:
-    var s = Control.new()
-    s.custom_minimum_size = Vector2(0, h)
-    return s
-
-
 func _update_status():
     var net = _net()
     var lobby = _steam_lobby()
 
-    # Steam header
     if lobby and lobby.available:
-        steamLabel.text = "[center][color=#8fc93a]Steam:[/color] " + lobby.MyName() + "[/center]"
+        steamLabel.text = "[right][color=#8fc93a]Steam:[/color] " + lobby.MyName() + "[/right]"
     elif lobby:
-        steamLabel.text = "[center][color=gray]Steam: not available — direct IP only[/color][/center]"
+        steamLabel.text = "[right][color=gray]Steam: not available[/color][/right]"
     else:
-        steamLabel.text = "[center][color=gray]Steam: not loaded[/color][/center]"
+        steamLabel.text = "[right][color=gray]Steam: not loaded[/color][/right]"
 
     var steam_ok: bool = lobby != null and lobby.available
 
-    # Direct IP label reflects whether it's the primary path or a fallback
-    if directIpLabel:
-        if steam_ok:
-            directIpLabel.text = "[center][color=#606060]Direct IP (fallback)[/color][/center]"
-        else:
-            directIpLabel.text = "[center][color=gray]Direct IP[/color][/center]"
+    var is_host: bool = net != null and net.IsActive() and net.IsHost()
+    var is_client: bool = net != null and net.IsActive() and !net.IsHost()
+    var is_connected: bool = is_host or is_client
 
     if net == null:
-        statusLabel.text = "[center][color=gray]Network not loaded[/color][/center]"
-        hostBtn.disabled = true
-        joinBtn.disabled = true
-        inviteBtn.disabled = true
-        dcBtn.disabled = true
+        statusLabel.text = "[right][color=gray]Network not loaded[/color][/right]"
     elif !net.IsActive():
-        statusLabel.text = "[center][color=gray]Disconnected[/color][/center]"
-        hostBtn.disabled = false
-        joinBtn.disabled = false
-        inviteBtn.disabled = true
-        dcBtn.disabled = true
-        ipInput.editable = true
-    elif net.IsHost():
+        statusLabel.text = "[right][color=gray]Disconnected[/color][/right]"
+    elif is_host:
         var peers = multiplayer.get_peers().size()
         var transport_tag = "Steam" if net.IsSteamTransport() else "ENet"
-        statusLabel.text = "[center][color=#8fc93a]Hosting[/color] (" + transport_tag + ") — " + str(peers) + " player(s)[/center]"
-        hostBtn.disabled = true
-        joinBtn.disabled = true
-        inviteBtn.disabled = !(steam_ok and lobby.InLobby())
-        dcBtn.disabled = false
-        ipInput.editable = false
+        statusLabel.text = "[right][color=#8fc93a]Hosting[/color] (" + transport_tag + ") — " + str(peers + 1) + " player(s)[/right]"
     else:
         var transport_tag2 = "Steam" if net.IsSteamTransport() else "ENet"
-        statusLabel.text = "[center][color=#8fc93a]Connected[/color] (" + transport_tag2 + ")[/center]"
-        hostBtn.disabled = true
-        joinBtn.disabled = true
-        inviteBtn.disabled = true
-        dcBtn.disabled = false
-        ipInput.editable = false
+        statusLabel.text = "[right][color=#8fc93a]Connected[/color] (" + transport_tag2 + ")[/right]"
+
+    hostBtn.disabled = is_connected
+    inviteBtn.disabled = !(is_host and steam_ok and lobby.InLobby())
+    dcBtn.disabled = !is_connected
+
+    _update_player_list(is_connected)
+    _update_start_buttons(is_host, is_client)
+
+
+func _update_player_list(is_connected: bool):
+    if !is_connected:
+        playersLabel.text = "[right][color=gray]Not connected[/color][/right]"
+        return
+    var pm = _pm()
+    var names: Array = []
+    var my_id: int = multiplayer.get_unique_id()
+    if pm and pm.peer_names:
+        var ids: Array = pm.peer_names.keys()
+        ids.sort()
+        for id in ids:
+            var name_str: String = str(pm.peer_names[id])
+            var tag: String = " (you)" if id == my_id else ""
+            var role: String = " [color=#8fc93a][host][/color]" if id == 1 else ""
+            names.append(name_str + role + tag)
+    if names.is_empty():
+        playersLabel.text = "[right][color=gray]Waiting for players...[/color][/right]"
+    else:
+        playersLabel.text = "[right]" + "\n".join(names) + "[/right]"
+
+
+func _update_start_buttons(is_host: bool, is_client: bool):
+    continueBtn.visible = is_host
+    newGameBtn.visible = is_host
+    waitingLabel.visible = is_client
+
+    if is_host:
+        var has_save: bool = Loader.ValidateShelter() != ""
+        continueBtn.disabled = !has_save
 
 
 func _on_coop_pressed():
-    if coopPanel && menuMain:
+    if coopPanel and menuMain:
         coopPanel.show()
         menuMain.hide()
 
 
 func _on_return():
-    if coopPanel && menuMain:
+    if coopPanel and menuMain:
         coopPanel.hide()
         menuMain.show()
 
@@ -331,12 +353,6 @@ func _on_host():
         lobby.CreateLobby()
 
 
-func _on_join():
-    var net = _net()
-    if net:
-        net.JoinGame(ipInput.text)
-
-
 func _on_invite():
     var lobby = _steam_lobby()
     if lobby:
@@ -350,6 +366,32 @@ func _on_dc():
     var lobby = _steam_lobby()
     if lobby:
         lobby.LeaveLobby()
+
+
+func _on_continue():
+    var net = _net()
+    if !net or !net.IsActive() or !net.IsHost():
+        return
+    var target: String = Loader.ValidateShelter()
+    if target == "":
+        return
+    if coopPanel:
+        coopPanel.hide()
+    Loader.LoadScene(target)
+
+
+func _on_new_game():
+    var net = _net()
+    if !net or !net.IsActive() or !net.IsHost():
+        return
+    var scene = get_tree().current_scene
+    if scene == null:
+        return
+    var modes = scene.get_node_or_null("Modes")
+    if coopPanel:
+        coopPanel.hide()
+    if modes:
+        modes.show()
 
 
 func _on_lobby_created_ok(id: int):

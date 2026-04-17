@@ -33,4 +33,4 @@ func ExplosionDamage():
         return
 
 
-    _pm().RequestPlayerExplosionDamage(puppet.peer_id)
+    _pm()._interactable_sync().RequestPlayerExplosionDamage(puppet.peer_id)

@@ -1,11 +1,5 @@
 extends "res://Scripts/Compiler.gd"
 
-# Vanilla Compiler.Spawn() calls Loader.LoadCharacter + LoadShelter + LoadWorld
-# on every scene entry, all of which read the client's stale local save files
-# and clobber the live coop state. Coop clients skip super() entirely and
-# restore from PlayerManager.coopCharacterBuffer instead. Shelter default
-# layout is preserved; container contents lazy-sync from host on interact.
-
 var _net_c: Node
 var _pm_c: Node
 func _net():
@@ -36,10 +30,17 @@ func _coop_client_spawn():
     else:
         Simulation.simulate = true
 
+    _pm()._coop_loading = true
+
+    if _pm().coopCharacterBuffer == null:
+        await get_tree().create_timer(1.0, false).timeout
+
     if _pm().coopCharacterBuffer != null:
         await _pm().LoadClientCharacterBuffer()
     else:
         await _pm().GiveClientStarterKit()
+
+    _pm()._coop_loading = false
 
     gameData.isTransitioning = false
     gameData.isSleeping = false

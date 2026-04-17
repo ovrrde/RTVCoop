@@ -184,7 +184,7 @@ func SetPeerTimeouts():
     if !peer.host:
         return
     for p in peer.host.get_peers():
-        p.set_timeout(0, 0, PEER_TIMEOUT_MS)
+        p.set_timeout(0, PEER_TIMEOUT_MS, PEER_TIMEOUT_MS)
 
 
 func IsHost() -> bool:

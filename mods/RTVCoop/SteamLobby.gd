@@ -55,8 +55,8 @@ func _ready():
 
 func _check_cold_start_join():
     # Steam appends "+connect_lobby <id>" to argv when launching the game from
-    # a friend's "Join Game" while we were offline. The join_requested signal
-    # only fires for in-game invites, so cold-starts must be parsed manually.
+    # a friend's "Join Game" when offline. The join_requested signal
+    # only fires for in-game invites (evidently), so cold-starts gotta be parsed manually
     var args = OS.get_cmdline_args()
     for i in args.size():
         if args[i] == "+connect_lobby" and i + 1 < args.size():

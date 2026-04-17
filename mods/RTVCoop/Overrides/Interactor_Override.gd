@@ -82,6 +82,8 @@ func Interact():
                 target.owner.Interact()
 
         elif !gameData.decor && target.is_in_group("Item"):
+            if _net() && _net().IsActive() && _pm()._is_trader_display_item(target):
+                return
             gameData.interaction = true
             var net = _net()
             if net && net.IsActive() && target.has_meta("network_uuid"):

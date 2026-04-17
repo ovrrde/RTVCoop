@@ -11,19 +11,27 @@ func _pm():
 
 
 func _ready():
-    var shouldGenerate = _pm().ShouldGenerateLoot()
+    add_to_group("CoopLootContainer")
 
-    if shouldGenerate && !custom && !locked && !furniture:
+    var is_coop = _net() and _net().IsActive()
+
+    var seed_val: int = 0
+    if is_coop:
+        seed_val = await _pm().CoopSeedForNode(self)
+        if seed_val != 0:
+            seed(seed_val)
+
+    if !custom && !locked && !furniture:
         ClearBuckets()
         FillBuckets()
         GenerateLoot()
 
-    if shouldGenerate && custom && !force:
+    if custom && !force:
         ClearBuckets()
         FillBucketsCustom()
         GenerateLoot()
 
-    if shouldGenerate && custom && force:
+    if custom && force:
         for index in custom.items.size():
             CreateLoot(custom.items[index])
 
@@ -32,13 +40,11 @@ func _ready():
             process_mode = ProcessMode.PROCESS_MODE_DISABLED
             hide()
 
+    if is_coop:
+        randomize()
+
 
 func Interact():
-    if !locked:
-        if _net().IsActive() && !multiplayer.is_server():
-            _pm().RequestContainerOpen.rpc_id(1, get_path())
-            return
-
-        var UIManager = get_tree().current_scene.get_node("/root/Map/Core/UI")
-        UIManager.OpenContainer(self)
-        ContainerAudio()
+    if locked:
+        return
+    _pm().TryOpenContainer(self)

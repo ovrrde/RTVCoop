@@ -12,13 +12,8 @@ func _pm():
 
 func _ready():
     get_child(0).queue_free()
-
-    # Seed deterministically across host + clients so all generation branches
-    # produce identical loot. Must wrap every branch.
-    var wasSeeded = false
-    if _net().IsActive():
-        seed(hash(str(get_path())))
-        wasSeeded = true
+    if _net().IsActive() and !multiplayer.is_server():
+        return
 
     if !custom:
         ClearBuckets()
@@ -35,6 +30,3 @@ func _ready():
         for index in custom.items.size():
             loot.append(custom.items[index])
             SpawnItems()
-
-    if wasSeeded:
-        randomize()

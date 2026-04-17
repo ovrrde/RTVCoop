@@ -12,14 +12,14 @@ func _pm():
 
 func Interact():
     if _net().IsActive() && !multiplayer.is_server():
-        _pm().RequestSwitchToggle.rpc_id(1, get_path())
+        _pm()._interactable_sync().RequestSwitchToggle.rpc_id(1, get_path())
         return
 
     var newActive = !active
     ApplySwitchState(newActive)
 
     if _net().IsActive() && multiplayer.is_server():
-        _pm().BroadcastSwitchState.rpc(get_path(), newActive)
+        _pm()._interactable_sync().BroadcastSwitchState.rpc(get_path(), newActive)
 
 
 func ApplySwitchState(newActive: bool):

@@ -1,4 +1,4 @@
-extends "res://Scripts/Simulation.gd"
+extends "res://Scripts/UIManager.gd"
 
 var _net_c: Node
 var _pm_c: Node
@@ -10,7 +10,9 @@ func _pm():
     return _pm_c
 
 
-func _process(delta):
-    if simulate and _net() and _net().IsActive() and !multiplayer.is_server():
+func OpenContainer(container: LootContainer):
+    var pm = _pm()
+    if !pm or !_net() or !_net().IsActive() or pm._container_open_bypassed:
+        super(container)
         return
-    super(delta)
+    pm.TryOpenContainer(container)

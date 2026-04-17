@@ -11,6 +11,9 @@ const YELLOW = "#e0c850"
 const BLUE = "#50a0e0"
 
 
+var _overlay_visible: bool = false
+
+
 func _ready():
     layer = 100
 
@@ -31,6 +34,7 @@ func _ready():
     label.offset_top = 10
     label.offset_bottom = 300
     label.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+    label.visible = false
 
     add_child(label)
 
@@ -39,7 +43,16 @@ func _val(color: String, value: String) -> String:
     return "[color=" + color + "]" + value + "[/color]"
 
 
+func _input(event):
+    if event is InputEventKey and event.pressed and !event.echo:
+        if event.physical_keycode == KEY_F5:
+            _overlay_visible = !_overlay_visible
+            label.visible = _overlay_visible
+
+
 func _process(_delta):
+    if !_overlay_visible:
+        return
     var net = get_tree().root.get_node_or_null("Network")
     var pm = get_tree().root.get_node_or_null("PlayerManager")
 

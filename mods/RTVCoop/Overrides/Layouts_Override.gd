@@ -1,4 +1,4 @@
-extends "res://Scripts/Simulation.gd"
+extends "res://Scripts/Layouts.gd"
 
 var _net_c: Node
 var _pm_c: Node
@@ -10,7 +10,9 @@ func _pm():
     return _pm_c
 
 
-func _process(delta):
-    if simulate and _net() and _net().IsActive() and !multiplayer.is_server():
-        return
-    super(delta)
+func _ready():
+    if _net() and _net().IsActive():
+        var s = await _pm().CoopSeedForNode(self)
+        if s != 0:
+            seed(s)
+    super()

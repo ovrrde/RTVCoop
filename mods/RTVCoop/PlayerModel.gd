@@ -10,7 +10,6 @@ var flashVFX = preload("res://Effects/Muzzle_Flash.tscn")
 
 var currentWeaponFile: String = ""
 var currentAnim: String = ""
-var wasFiring: bool = false
 var currentWeaponNode: Node = null
 var animPlayer: AnimationPlayer = null
 
@@ -40,6 +39,8 @@ func _ready():
     if aiInstance.is_in_group("AI"):
         aiInstance.remove_from_group("AI")
 
+    _coop_strip_puppet_pickups(aiInstance)
+
     aiInstance.show()
     aiInstance.pause = false
     aiInstance.collision_layer = 0
@@ -67,6 +68,19 @@ func CaptureInitialWeaponFile():
     await get_tree().physics_frame
     if aiInstance && aiInstance.weapon && aiInstance.weapon.slotData && aiInstance.weapon.slotData.itemData:
         currentWeaponFile = aiInstance.weapon.slotData.itemData.file
+
+
+func _coop_strip_puppet_pickups(node: Node) -> void:
+    if node is Pickup:
+        if node.is_in_group("Item"):
+            node.remove_from_group("Item")
+        if node is CollisionObject3D:
+            node.collision_layer = 0
+            node.collision_mask = 0
+        if node.has_method("Freeze"):
+            node.Freeze()
+    for child in node.get_children():
+        _coop_strip_puppet_pickups(child)
 
 
 func _pick_animation(state: Dictionary) -> String:
@@ -139,10 +153,16 @@ func ApplyAnimState(state: Dictionary):
             child.visible = hasWeapon
 
 
-    var isFiring: bool = state.get("isFiring", false)
-    if isFiring && !wasFiring:
-        PlayPuppetFireEffect()
-    wasFiring = isFiring
+    var shots: int = state.get("shots", 0)
+    var suppressed: bool = state.get("suppressed", false)
+    var fireMode: int = state.get("fireMode", 1)
+    for i in shots:
+        PlayPuppetFireEffect(suppressed, fireMode)
+
+    _apply_puppet_attachments(state.get("attachments", []))
+    _apply_puppet_flashlight(state.get("flashlight", false))
+    _apply_puppet_spine_pitch(state.get("pitch", 0.0))
+    _update_puppet_flashlight_transform()
 
 
 func OnPuppetDeath():
@@ -179,20 +199,25 @@ func OnPuppetRespawn():
         animPlayer.play("Rifle_Idle", 0.3)
 
 
-func PlayPuppetFireEffect():
+func PlayPuppetFireEffect(suppressed: bool = false, fireMode: int = 1):
     if !currentWeaponNode:
         return
     var muzzleNode = currentWeaponNode.get_node_or_null("Muzzle")
     if !muzzleNode:
         return
-    var flash = flashVFX.instantiate()
-    muzzleNode.add_child(flash)
-    flash.Emit(true, 0.05)
+    if !suppressed:
+        var flash = flashVFX.instantiate()
+        muzzleNode.add_child(flash)
+        flash.Emit(true, 0.05)
     var audio = audioInstance3D.instantiate()
     muzzleNode.add_child(audio)
-    if currentWeaponNode.slotData && currentWeaponNode.slotData.itemData:
+    if currentWeaponNode.slotData and currentWeaponNode.slotData.itemData:
         var weaponData = currentWeaponNode.slotData.itemData
-        if weaponData.get("fireSemi"):
+        if suppressed and weaponData.get("fireSuppressed"):
+            audio.PlayInstance(weaponData.fireSuppressed, 20, 200)
+        elif fireMode == 2 and weaponData.get("fireAuto"):
+            audio.PlayInstance(weaponData.fireAuto, 20, 200)
+        elif weaponData.get("fireSemi"):
             audio.PlayInstance(weaponData.fireSemi, 20, 200)
 
 
@@ -235,3 +260,73 @@ func SwapWeapon(file: String):
                     var magazine = attachments.get_node_or_null(weaponData.compatible[0].file)
                     if magazine:
                         magazine.show()
+
+
+var _current_attachments: Array = []
+var _current_flashlight: bool = false
+var _spine_bone: int = -1
+var _spine_pitch: float = 0.0
+
+
+func _apply_puppet_attachments(attachmentFiles: Array):
+    if !currentWeaponNode or attachmentFiles == _current_attachments:
+        return
+    _current_attachments = attachmentFiles.duplicate()
+
+    var attachments = currentWeaponNode.get_node_or_null("Attachments")
+    if !attachments:
+        return
+
+    for child in attachments.get_children():
+        child.hide()
+
+    for file in attachmentFiles:
+        var node = attachments.get_node_or_null(str(file))
+        if node:
+            node.show()
+
+
+func _apply_puppet_spine_pitch(pitch: float):
+    if !aiInstance or !aiInstance.skeleton:
+        return
+    if _spine_bone < 0:
+        _spine_bone = aiInstance.spineData.bone if aiInstance.spineData else 12
+    _spine_pitch = lerp(_spine_pitch, pitch, 0.15)
+    var skel = aiInstance.skeleton
+    var bonePose: Transform3D = skel.get_bone_global_pose_no_override(_spine_bone)
+    bonePose.basis = bonePose.basis.rotated(bonePose.basis.x, -_spine_pitch * 0.7)
+    skel.set_bone_global_pose_override(_spine_bone, bonePose, 1.0, true)
+
+
+var _puppet_spotlight: SpotLight3D = null
+
+func _apply_puppet_flashlight(on: bool):
+    if on == _current_flashlight:
+        return
+    _current_flashlight = on
+
+    if !aiInstance:
+        return
+
+    if on:
+        if !_puppet_spotlight:
+            _puppet_spotlight = SpotLight3D.new()
+            _puppet_spotlight.name = "_coop_flashlight"
+            _puppet_spotlight.spot_angle = 30.0
+            _puppet_spotlight.spot_range = 50.0
+            _puppet_spotlight.light_energy = 20.0
+            _puppet_spotlight.light_color = Color.WHITE
+            _puppet_spotlight.shadow_enabled = false
+            aiInstance.add_child(_puppet_spotlight)
+        _puppet_spotlight.visible = true
+    else:
+        if _puppet_spotlight:
+            _puppet_spotlight.visible = false
+
+
+func _update_puppet_flashlight_transform():
+    if !_puppet_spotlight or !_puppet_spotlight.visible:
+        return
+    if aiInstance and aiInstance.eyes:
+        _puppet_spotlight.global_position = aiInstance.eyes.global_position
+        _puppet_spotlight.global_basis = aiInstance.eyes.global_basis * Basis(Vector3.UP, PI)

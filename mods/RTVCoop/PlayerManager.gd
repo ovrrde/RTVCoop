@@ -12,10 +12,8 @@ func _steam_lobby():
     return _steam_lobby_c
 
 
-var REMOTE_PLAYER: PackedScene = null
 const BROADCAST_RATE = 20.0
 const SIMULATION_BROADCAST_RATE = 1.0
-const AI_BROADCAST_RATE = 20.0
 
 
 var gameData = preload("res://Resources/GameData.tres")
@@ -23,25 +21,53 @@ var gameData = preload("res://Resources/GameData.tres")
 
 var remotePlayers: Dictionary = {}
 var peer_names: Dictionary = {}
+var _container_open_bypassed: bool = false
 var broadcastAccumulator: float = 0.0
 var simulationAccumulator: float = 0.0
-var aiAccumulator: float = 0.0
+var _local_shot_count: int = 0
+var _was_firing_local: bool = false
+var _coop_save_timer: float = 0.0
+const COOP_SAVE_INTERVAL: float = 60.0
 
-# In-memory CharacterSave snapshot for coop clients — replaces disk roundtrip.
 var coopCharacterBuffer: CharacterSave = null
+var sceneReady: bool = false
+var _coop_loading: bool = false
+
+# uuid -> {"pos": Vector3, "rot": Vector3, "frozen": bool}; receiver lerps toward these
+var _pickup_targets: Dictionary = {}
+const PICKUP_LERP_SPEED: float = 18.0
+
+# mixed into loot seeding so containers vary per session but host/client agree within one
+var coopSessionSeed: int = 0
 
 
 func _ready():
-    REMOTE_PLAYER = load("res://mods/RTVCoop/Scenes/RemotePlayer.tscn")
-    if !REMOTE_PLAYER:
-        print("[PlayerManager] ERROR: Could not load RemotePlayer.tscn")
-    else:
-        print("[PlayerManager] RemotePlayer.tscn loaded OK")
     _net().disconnected.connect(_on_disconnected)
     _net().hosted.connect(_on_hosted)
     _net().joined.connect(_on_joined)
     _net().peer_joined.connect(_on_peer_joined_for_names)
     _net().peer_left.connect(_on_peer_left_for_names)
+    _add_sync_module("res://mods/RTVCoop/Sync/EventSync.gd", "EventSync")
+    _add_sync_module("res://mods/RTVCoop/Sync/InteractableSync.gd", "InteractableSync")
+    _add_sync_module("res://mods/RTVCoop/Sync/ContainerSync.gd", "ContainerSync")
+    _add_sync_module("res://mods/RTVCoop/Sync/FurnitureSync.gd", "FurnitureSync")
+    _add_sync_module("res://mods/RTVCoop/Sync/AISync.gd", "AISync")
+    _add_sync_module("res://mods/RTVCoop/Sync/QuestSync.gd", "QuestSync")
+    _add_sync_module("res://mods/RTVCoop/Sync/WorldSync.gd", "WorldSync")
+    _add_sync_module("res://mods/RTVCoop/Sync/SlotSerializer.gd", "SlotSerializer")
+    _add_sync_module("res://mods/RTVCoop/Sync/PuppetManager.gd", "PuppetManager")
+
+
+func _add_sync_module(path: String, node_name: String):
+    var script = load(path)
+    if !script:
+        print("[PlayerManager] FAIL: could not load " + path)
+        return
+    var node = Node.new()
+    node.set_script(script)
+    node.name = node_name
+    add_child(node)
+    print("[PlayerManager] Module loaded: " + node_name)
 
 
 func _physics_process(delta):
@@ -69,6 +95,7 @@ func _physics_process(delta):
 
     ScanIfNeeded(delta)
     ReconcilePuppets()
+    _lerp_pickup_targets(delta)
 
 
     simulationAccumulator += delta
@@ -84,24 +111,16 @@ func _physics_process(delta):
             )
 
 
-    aiAccumulator += delta
-    if aiAccumulator >= 1.0 / AI_BROADCAST_RATE:
-        aiAccumulator = 0.0
-        if multiplayer.is_server():
-            BroadcastAIPositions()
-
+    if gameData.isFiring and !_was_firing_local:
+        _local_shot_count += 1
+    _was_firing_local = gameData.isFiring
 
     if !multiplayer.is_server():
-        for uuid in aiTargets:
-            if !worldAI.has(uuid):
-                continue
-            var ai = worldAI[uuid]
-            if !is_instance_valid(ai) || !ai.is_inside_tree():
-                continue
-            var target = aiTargets[uuid]
-            ai.global_position = ai.global_position.lerp(target.pos, AI_LERP_SPEED * delta)
-            ai.global_rotation.y = lerp_angle(ai.global_rotation.y, target.rot.y, AI_LERP_SPEED * delta)
-
+        _coop_save_timer += delta
+        if _coop_save_timer >= COOP_SAVE_INTERVAL:
+            _coop_save_timer = 0.0
+            if !gameData.isDead and !gameData.isCaching:
+                SaveClientCharacterBuffer()
 
     broadcastAccumulator += delta
 
@@ -114,106 +133,48 @@ func _physics_process(delta):
     BroadcastLocalState()
 
 
+func _puppet_manager() -> Node:
+    return get_node_or_null("PuppetManager")
+
+
 func ReconcilePuppets():
-
-    var map = GetMap()
-
-
-    if !map:
-
-        for id in remotePlayers.keys().duplicate():
-            if !is_instance_valid(remotePlayers[id]):
-                remotePlayers.erase(id)
-        return
-
-
-    var myId = multiplayer.get_unique_id()
-
-    # peer_names is server-authoritative and contains every active peer on
-    # every player. multiplayer.get_peers() only returns the server on clients
-    # due to Godot's star topology, so it misses other clients entirely.
-    var knownPeers: Array = peer_names.keys()
-
-
-    for peerId in knownPeers:
-
-        if peerId == myId:
-            continue
-
-
-        if !remotePlayers.has(peerId) || !is_instance_valid(remotePlayers[peerId]):
-
-            if remotePlayers.has(peerId):
-                remotePlayers.erase(peerId)
-
-            SpawnPuppet(peerId)
-
-
-    var toRemove = []
-
-    for peerId in remotePlayers.keys():
-        if !(peerId in knownPeers):
-            toRemove.append(peerId)
-
-
-    for peerId in toRemove:
-        DespawnPuppet(peerId)
-
-
-const PASSTHROUGH_MAPS := ["Cabin"]
+    var pm = _puppet_manager()
+    if pm:
+        pm.ReconcilePuppets()
 
 
 func SpawnPuppet(peerId: int):
-
-    var map = GetMap()
-
-    if !map:
-        return
-
-
-    var puppet = REMOTE_PLAYER.instantiate()
-    puppet.peer_id = peerId
-    puppet.name = "RemotePlayer_" + str(peerId)
-
-
-    map.add_child(puppet)
-    remotePlayers[peerId] = puppet
-
-
-    var mapName: String = str(map.get("mapName")) if map.get("mapName") else ""
-    if mapName in PASSTHROUGH_MAPS:
-        var local_ctrl = GetLocalController()
-        if local_ctrl and puppet is PhysicsBody3D:
-            local_ctrl.add_collision_exception_with(puppet)
-
-
-    print("PlayerManager: spawned puppet for peer " + str(peerId))
+    var pm = _puppet_manager()
+    if pm:
+        pm.SpawnPuppet(peerId)
 
 
 func DespawnPuppet(peerId: int):
-
-    if !remotePlayers.has(peerId):
-        return
-
-
-    var puppet = remotePlayers[peerId]
-
-    if is_instance_valid(puppet):
-        puppet.queue_free()
-
-
-    remotePlayers.erase(peerId)
-
-
-    print("PlayerManager: despawned puppet for peer " + str(peerId))
+    var pm = _puppet_manager()
+    if pm:
+        pm.DespawnPuppet(peerId)
 
 
 func _on_disconnected():
+    var scene = get_tree().current_scene
+    var in_game: bool = scene != null and scene.name == "Map"
 
     for id in remotePlayers.keys().duplicate():
         DespawnPuppet(id)
     peer_names.clear()
+    if _container_sync():
+        _container_sync()._container_holders.clear()
     coopCharacterBuffer = null
+    coopSessionSeed = 0
+    sceneReady = false
+    pendingSceneChange = ""
+    pendingSpawnPosition = Vector3.ZERO
+    pendingHostReady = -1.0
+    pendingSecondLootSync = -1.0
+
+    if in_game:
+        Loader.Message("Coop ended — returning to menu", Color.ORANGE)
+        Loader.LoadScene("Menu")
 
 
 # ─── Display name sync ────────────────────────────────────────────────────────
@@ -241,16 +202,41 @@ func _on_joined():
     var my_name = GetMyDisplayName()
     print("[PlayerManager] Reporting name to host: " + my_name)
     ReportPlayerName.rpc_id(1, my_name)
+    print("[PlayerManager] _on_joined: invalidating lastKnownMap to force scene re-sync")
+    worldItems.clear()
+    worldFurniture.clear()
+    worldAI.clear()
+    aiTargets.clear()
+    nextUuid = 0
+    nextFurnitureId = 0
+    if _ai_sync():
+        _ai_sync()._pending_spawns.clear()
+    lastKnownMap = null
 
 
 func _on_peer_joined_for_names(_id: int):
-    # Server side: a new client connected. Resend the full registry to all
-    # peers so the new arrival learns existing names. We delay briefly so
-    # the client's own ReportPlayerName RPC has a chance to land first.
     if !multiplayer.is_server():
         return
+    if coopSessionSeed == 0:
+        coopSessionSeed = _make_session_seed()
+        print("[PlayerManager] Session seed generated on host: " + str(coopSessionSeed))
     await get_tree().create_timer(0.5, false).timeout
     SyncNameRegistry.rpc(peer_names)
+    DeliverSessionSeed.rpc_id(_id, coopSessionSeed)
+    if _quest_sync():
+        _quest_sync().push_full_state_to(_id)
+
+    # tell joiner which scene if host's already in one — otherwise they'd wait forever
+    var map = GetMap()
+    if map:
+        var mapName: String = str(map.get("mapName")) if map.get("mapName") else ""
+        if mapName != "":
+            var controller = GetLocalController()
+            var hostPos: Vector3 = controller.global_position if controller else Vector3.ZERO
+            print("[PlayerManager] Sending HostSceneReady to new peer " + str(_id) + " for " + mapName)
+            HostSceneReady.rpc_id(_id, mapName, hostPos, coopSessionSeed)
+
+    _try_deliver_coop_save(_id)
 
 
 func _on_peer_left_for_names(id: int):
@@ -259,6 +245,13 @@ func _on_peer_left_for_names(id: int):
     if peer_names.has(id):
         peer_names.erase(id)
     SyncNameRegistry.rpc(peer_names)
+    if _container_sync():
+        _container_sync().release_holders_for_peer(id)
+    var es = _event_sync()
+    if es and es._sleep_ready.has(id):
+        es._sleep_ready.erase(id)
+        var total: int = 1 + _net().GetPeerIds().size()
+        es.BroadcastSleepStatus.rpc(es._sleep_ready.keys(), total)
 
 
 @rpc("any_peer", "call_remote", "reliable")
@@ -277,10 +270,45 @@ func SyncNameRegistry(registry: Dictionary):
     print("[PlayerManager] Name registry synced (" + str(peer_names.size()) + " players)")
 
 
+@rpc("authority", "call_remote", "reliable")
+func DeliverSessionSeed(seed_value: int):
+    coopSessionSeed = seed_value
+    print("[PlayerManager] Session seed received: " + str(seed_value))
+
+
+func _make_session_seed() -> int:
+    var t = Time.get_unix_time_from_system()
+    var s = int(t) ^ int(t * 1000.0) & 0x7FFFFFFF
+    if s == 0:
+        s = 1
+    return s
+
+
+# Host: if seed is 0 (fresh scene), generate + broadcast. Returns current seed.
+func _ensure_session_seed() -> int:
+    if coopSessionSeed != 0:
+        return coopSessionSeed
+    if !multiplayer.is_server():
+        return 0
+    coopSessionSeed = _make_session_seed()
+    print("[PlayerManager] Per-scene seed generated: " + str(coopSessionSeed))
+    if _net() and _net().IsActive():
+        DeliverSessionSeed.rpc(coopSessionSeed)
+    return coopSessionSeed
+
+
 # ─── Coop client character buffer ────────────────────────────────────────────
 
 func SaveClientCharacterBuffer():
     if multiplayer.is_server():
+        return
+
+    if _coop_loading:
+        print("[PlayerManager] COOP SAVE: skipped — buffer is being restored (would clobber with partial state)")
+        return
+
+    if !sceneReady:
+        print("[PlayerManager] COOP SAVE: skipped — scene not ready yet")
         return
 
     var interface = get_tree().current_scene.get_node_or_null("/root/Map/Core/UI/Interface")
@@ -352,11 +380,12 @@ func SaveClientCharacterBuffer():
     coopCharacterBuffer = character
     print("[PlayerManager] COOP SAVE: Character -> buffer (" + str(character.inventory.size()) + " inv, " + str(character.equipment.size()) + " eqp, " + str(character.catalog.size()) + " cat)")
 
+    if _net().IsActive() and !multiplayer.is_server():
+        var serialized = _serialize_character(character)
+        SubmitClientCharacterData.rpc_id(1, serialized)
+
 
 func GiveClientStarterKit():
-    # Mirrors the initialSpawn path in vanilla Loader.LoadCharacter. Fires
-    # on a client's first coop scene entry (buffer is null). Field access
-    # on the Loader autoload works even though method overrides don't.
     if multiplayer.is_server():
         return
 
@@ -394,6 +423,8 @@ func LoadClientCharacterBuffer():
     if coopCharacterBuffer == null:
         return
 
+    _coop_loading = true
+
     await get_tree().create_timer(0.1).timeout
 
     var character: CharacterSave = coopCharacterBuffer
@@ -404,10 +435,9 @@ func LoadClientCharacterBuffer():
 
     if !interface or !rigManager:
         print("[PlayerManager] COOP LOAD: interface/rigManager missing, skipping")
+        _coop_loading = false
         return
 
-    # Wipe any existing interface/rig state before rebuilding from the buffer.
-    # ClearRig() also resets gameData.primary/secondary/knife flags.
     for child in interface.inventoryGrid.get_children():
         interface.inventoryGrid.remove_child(child)
         child.queue_free()
@@ -424,13 +454,16 @@ func LoadClientCharacterBuffer():
     await get_tree().process_frame
 
     for slotData in character.inventory:
-        interface.LoadGridItem(slotData, interface.inventoryGrid, slotData.gridPosition)
+        if slotData and slotData.itemData:
+            interface.LoadGridItem(slotData, interface.inventoryGrid, slotData.gridPosition)
 
     for slotData in character.equipment:
-        interface.LoadSlotItem(slotData, slotData.slot)
+        if slotData and slotData.itemData:
+            interface.LoadSlotItem(slotData, slotData.slot)
 
     for slotData in character.catalog:
-        interface.LoadGridItem(slotData, interface.catalogGrid, slotData.gridPosition)
+        if slotData and slotData.itemData:
+            interface.LoadGridItem(slotData, interface.catalogGrid, slotData.gridPosition)
 
     interface.UpdateStats(false)
 
@@ -483,6 +516,149 @@ func LoadClientCharacterBuffer():
         NVG.Load()
 
     print("[PlayerManager] COOP LOAD: Character <- buffer (" + str(character.inventory.size()) + " inv, " + str(character.equipment.size()) + " eqp, " + str(character.catalog.size()) + " cat)")
+
+    _coop_loading = false
+
+
+func _serialize_character(character: CharacterSave) -> Dictionary:
+    var data: Dictionary = {
+        "health": character.health, "energy": character.energy,
+        "hydration": character.hydration, "mental": character.mental,
+        "temperature": character.temperature, "bodyStamina": character.bodyStamina,
+        "armStamina": character.armStamina,
+        "overweight": character.overweight, "starvation": character.starvation,
+        "dehydration": character.dehydration, "bleeding": character.bleeding,
+        "fracture": character.fracture, "burn": character.burn,
+        "frostbite": character.frostbite, "insanity": character.insanity,
+        "rupture": character.rupture, "headshot": character.headshot,
+        "cat": character.cat, "catFound": character.catFound, "catDead": character.catDead,
+        "primary": character.primary, "secondary": character.secondary,
+        "knife": character.knife, "grenade1": character.grenade1,
+        "grenade2": character.grenade2, "flashlight": character.flashlight,
+        "NVG": character.NVG, "weaponPosition": character.weaponPosition,
+    }
+    data["inventory"] = []
+    for slot in character.inventory:
+        var d = SerializeSlotData(slot)
+        d["gridPosition"] = slot.gridPosition
+        d["gridRotated"] = slot.gridRotated
+        data["inventory"].append(d)
+    data["equipment"] = []
+    for slot in character.equipment:
+        var d = SerializeSlotData(slot)
+        d["slotName"] = slot.slot
+        data["equipment"].append(d)
+    data["catalog"] = []
+    for slot in character.catalog:
+        var d = SerializeSlotData(slot)
+        d["gridPosition"] = slot.gridPosition
+        d["gridRotated"] = slot.gridRotated
+        if slot.storage.size() > 0:
+            var storage_arr: Array = []
+            for s in slot.storage:
+                storage_arr.append(SerializeSlotData(s))
+            d["storage_data"] = storage_arr
+        data["catalog"].append(d)
+    return data
+
+
+func _deserialize_character(data: Dictionary) -> CharacterSave:
+    var character: CharacterSave = CharacterSave.new()
+    character.initialSpawn = false
+    character.startingKit = null
+    character.health = data.get("health", 100.0)
+    character.energy = data.get("energy", 100.0)
+    character.hydration = data.get("hydration", 100.0)
+    character.mental = data.get("mental", 100.0)
+    character.temperature = data.get("temperature", 100.0)
+    character.bodyStamina = data.get("bodyStamina", 100.0)
+    character.armStamina = data.get("armStamina", 100.0)
+    character.overweight = data.get("overweight", false)
+    character.starvation = data.get("starvation", false)
+    character.dehydration = data.get("dehydration", false)
+    character.bleeding = data.get("bleeding", false)
+    character.fracture = data.get("fracture", false)
+    character.burn = data.get("burn", false)
+    character.frostbite = data.get("frostbite", false)
+    character.insanity = data.get("insanity", false)
+    character.rupture = data.get("rupture", false)
+    character.headshot = data.get("headshot", false)
+    character.cat = data.get("cat", 100.0)
+    character.catFound = data.get("catFound", false)
+    character.catDead = data.get("catDead", false)
+    character.primary = data.get("primary", false)
+    character.secondary = data.get("secondary", false)
+    character.knife = data.get("knife", false)
+    character.grenade1 = data.get("grenade1", false)
+    character.grenade2 = data.get("grenade2", false)
+    character.flashlight = data.get("flashlight", false)
+    character.NVG = data.get("NVG", false)
+    character.weaponPosition = data.get("weaponPosition", 1)
+    character.inventory.clear()
+    for d in data.get("inventory", []):
+        var slot = DeserializeSlotData(d)
+        if slot:
+            slot.gridPosition = d.get("gridPosition", Vector2.ZERO)
+            slot.gridRotated = d.get("gridRotated", false)
+            character.inventory.append(slot)
+    character.equipment.clear()
+    for d in data.get("equipment", []):
+        var slot = DeserializeSlotData(d)
+        if slot:
+            slot.slot = d.get("slotName", "")
+            character.equipment.append(slot)
+    character.catalog.clear()
+    for d in data.get("catalog", []):
+        var slot = DeserializeSlotData(d)
+        if slot:
+            slot.gridPosition = d.get("gridPosition", Vector2.ZERO)
+            slot.gridRotated = d.get("gridRotated", false)
+            if d.has("storage_data"):
+                for sd in d["storage_data"]:
+                    var stored = DeserializeSlotData(sd)
+                    if stored:
+                        slot.storage.append(stored)
+            character.catalog.append(slot)
+    return character
+
+
+func _coop_save_path(peer_id: int) -> String:
+    var name_key: String = ""
+    if peer_names.has(peer_id):
+        name_key = peer_names[peer_id]
+    if name_key == "":
+        name_key = str(peer_id)
+    name_key = name_key.replace(" ", "_").replace("/", "_").replace("\\", "_").replace(":", "_")
+    return "user://coop_" + name_key + ".tres"
+
+
+@rpc("any_peer", "reliable", "call_remote")
+func SubmitClientCharacterData(data: Dictionary):
+    if !multiplayer.is_server():
+        return
+    var sender = multiplayer.get_remote_sender_id()
+    var character = _deserialize_character(data)
+    var path = _coop_save_path(sender)
+    ResourceSaver.save(character, path)
+    print("[PlayerManager] Saved coop character for peer " + str(sender) + " to " + path)
+
+
+@rpc("authority", "reliable", "call_remote")
+func DeliverCoopSave(data: Dictionary):
+    coopCharacterBuffer = _deserialize_character(data)
+    print("[PlayerManager] Received coop save from host (" + str(coopCharacterBuffer.inventory.size()) + " inv, " + str(coopCharacterBuffer.equipment.size()) + " eqp)")
+
+
+func _try_deliver_coop_save(peer_id: int):
+    var path = _coop_save_path(peer_id)
+    if FileAccess.file_exists(path):
+        var character = load(path) as CharacterSave
+        if character:
+            var data = _serialize_character(character)
+            DeliverCoopSave.rpc_id(peer_id, data)
+            print("[PlayerManager] Delivered coop save to peer " + str(peer_id))
+            return
+    print("[PlayerManager] No coop save for peer " + str(peer_id) + " — they will get starter kit")
 
 
 func BroadcastLocalState():
@@ -561,9 +737,9 @@ func GatherLocalAnimState(controller: Node3D) -> Dictionary:
 
     var scene = get_tree().current_scene
     var rigManager = scene.get_node_or_null("Core/Camera/Manager") if scene else null
+    var weaponSlot = null
 
     if rigManager:
-        var weaponSlot = null
         if gameData.primary && rigManager.primarySlot && rigManager.primarySlot.get_child_count() > 0:
             weaponSlot = rigManager.primarySlot.get_child(0)
         elif gameData.secondary && rigManager.secondarySlot && rigManager.secondarySlot.get_child_count() > 0:
@@ -582,6 +758,30 @@ func GatherLocalAnimState(controller: Node3D) -> Dictionary:
             if knifeItem.slotData && knifeItem.slotData.itemData:
                 state["weaponFile"] = knifeItem.slotData.itemData.file
     state["isFiring"] = gameData.isFiring
+    state["shots"] = _local_shot_count
+    _local_shot_count = 0
+    state["fireMode"] = 1
+    if weaponSlot and weaponSlot.slotData:
+        state["fireMode"] = weaponSlot.slotData.mode
+    state["flashlight"] = gameData.flashlight
+    state["nvg"] = gameData.NVG
+
+    var attachmentFiles: Array = []
+    if weaponSlot and weaponSlot.slotData:
+        for nested in weaponSlot.slotData.nested:
+            if nested and nested.file:
+                attachmentFiles.append(nested.file)
+    state["attachments"] = attachmentFiles
+
+    var isSuppressed: bool = false
+    if rigManager and rigManager.get_child_count() > 0:
+        var rig = rigManager.get_child(rigManager.get_child_count() - 1)
+        if rig.get("activeMuzzle") != null and rig.activeMuzzle != null:
+            isSuppressed = true
+    state["suppressed"] = isSuppressed
+
+    var camera = scene.get_node_or_null("Core/Camera") if scene else null
+    state["pitch"] = camera.rotation.x if camera else 0.0
 
 
     return state
@@ -667,9 +867,6 @@ func ApplyPlayerDamage(targetPeerId: int, damage: int, penetration: int):
         return
 
 
-    print("PlayerManager: taking " + str(damage) + " damage from network (pen " + str(penetration) + ")")
-
-
     character.WeaponDamage(damage, penetration)
 
 
@@ -713,15 +910,16 @@ func ApplySceneChange(scene: String):
 
 
 @rpc("authority", "reliable", "call_remote")
-func HostSceneReady(sceneName: String = "", hostPos: Vector3 = Vector3.ZERO):
+func HostSceneReady(sceneName: String = "", hostPos: Vector3 = Vector3.ZERO, sceneSeed: int = 0):
+
+    if sceneSeed != 0:
+        coopSessionSeed = sceneSeed
 
     var targetScene = pendingSceneChange if pendingSceneChange != "" else sceneName
 
     if targetScene == "":
         return
 
-    # Already-in-scene guard — prevents a double Loader.LoadScene if the
-    # fallback timeout path fired first, or HostSceneReady arrived twice.
     var currentMap = GetMap()
     var currentSceneName = ""
     if currentMap:
@@ -731,133 +929,45 @@ func HostSceneReady(sceneName: String = "", hostPos: Vector3 = Vector3.ZERO):
         pendingSceneChange = ""
         pendingSceneTimer = 0.0
         if hostPos != Vector3.ZERO:
-            var peerId = multiplayer.get_unique_id()
-            var offset = Vector3(fmod(float(peerId), 4.0) - 2.0, 0, fmod(float(peerId), 3.0) - 1.5)
-            var controller = GetLocalController()
-            if controller:
-                controller.global_position = hostPos + offset
+            _coop_apply_client_spawn(hostPos)
         return
 
     if hostPos != Vector3.ZERO:
-        var peerId = multiplayer.get_unique_id()
-        var offset = Vector3(fmod(float(peerId), 4.0) - 2.0, 0, fmod(float(peerId), 3.0) - 1.5)
-        pendingSpawnPosition = hostPos + offset
-    print("[PlayerManager] Host ready in: " + targetScene + " — loading (spawn at " + str(pendingSpawnPosition) + ")")
+        pendingSpawnPosition = hostPos
+    print("[PlayerManager] Host ready in: " + targetScene + " — loading (host at " + str(pendingSpawnPosition) + ")")
 
-    # Must run BEFORE Loader.LoadScene so the buffer is populated while the
-    # old Interface still exists.
     SaveClientCharacterBuffer()
+
+    # pause stat drain across the full client transition; Compiler.Spawn clears this at the end
+    gameData.isTransitioning = true
 
     Loader.LoadScene(targetScene)
     pendingSceneChange = ""
     pendingSceneTimer = 0.0
 
 
-@rpc("any_peer", "reliable", "call_remote")
-func RequestDoorToggle(doorPath: NodePath):
-
-    if !multiplayer.is_server():
-        return
-
-
-    var door = get_node_or_null(doorPath)
-
-    if !door || !(door is Door):
-        return
-
-
-    if door.locked || door.isOccupied:
-        return
-
-
-    var newOpen = !door.isOpen
-    door.ApplyDoorState(newOpen)
-
-
-    BroadcastDoorState.rpc(doorPath, newOpen)
-
-
-@rpc("authority", "reliable", "call_remote")
-func BroadcastDoorState(doorPath: NodePath, newOpen: bool):
-
-    var door = get_node_or_null(doorPath)
-
-    if !door || !(door is Door):
-        return
-
-
-    door.ApplyDoorState(newOpen)
-
-
-@rpc("any_peer", "reliable", "call_remote")
-func RequestDoorUnlock(doorPath: NodePath):
-
-    if !multiplayer.is_server():
-        return
-
-
-    var door = get_node_or_null(doorPath)
-
-    if !door || !(door is Door):
-        return
-
-
-    door.ApplyDoorUnlock()
-    BroadcastDoorUnlock.rpc(doorPath)
-
-
-@rpc("authority", "reliable", "call_remote")
-func BroadcastDoorUnlock(doorPath: NodePath):
-
-    var door = get_node_or_null(doorPath)
-
-    if !door || !(door is Door):
-        return
-
-
-    door.ApplyDoorUnlock()
-
-
-@rpc("any_peer", "reliable", "call_remote")
-func RequestSwitchToggle(switchPath: NodePath):
-
-    if !multiplayer.is_server():
-        return
-
-
-    var sw = get_node_or_null(switchPath)
-
-    if !sw || !sw.has_method("ApplySwitchState"):
-        return
-
-
-    var newActive = !sw.active
-    sw.ApplySwitchState(newActive)
-
-
-    BroadcastSwitchState.rpc(switchPath, newActive)
-
-
-@rpc("authority", "reliable", "call_remote")
-func BroadcastSwitchState(switchPath: NodePath, newActive: bool):
-
-    var sw = get_node_or_null(switchPath)
-
-    if !sw || !sw.has_method("ApplySwitchState"):
-        return
-
-
-    sw.ApplySwitchState(newActive)
-
-
 var worldItems: Dictionary = {}
 var nextUuid: int = 0
 
+
+var worldFurniture: Dictionary = {}
+var nextFurnitureId: int = 0
+
 var lastKnownMap: Node = null
 var pendingSceneScan: float = -1.0
+
+var pendingSecondScan: float = -1.0
 var pendingHostReady: float = -1.0
 var pendingHostSceneName: String = ""
 var pendingSpawnPosition: Vector3 = Vector3.ZERO
+
+var pendingSecondLootSync: float = -1.0
+
+
+const LOOT_MANIFEST_DELAY = 2.0
+const HOST_READY_BROADCAST_DELAY: float = 3.0
+const CLIENT_RESYNC_DELAY: float = 4.0
+var pendingLootBroadcast: float = -1.0
 
 
 func ScanIfNeeded(delta: float):
@@ -868,27 +978,48 @@ func ScanIfNeeded(delta: float):
     if currentMap != lastKnownMap:
 
         worldItems.clear()
+        worldFurniture.clear()
+        worldAI.clear()
         aiTargets.clear()
         nextUuid = 0
+        nextFurnitureId = 0
+        pendingSecondLootSync = -1.0
+        sceneReady = false
+        # Host seed reset is done pre-LoadScene in Loader_Override so the
+        # scene's first _ready-triggered _ensure_session_seed generates the
+        # authoritative seed (same one broadcast via HostSceneReady). Resetting
+        # here would fuck it and force a second, different seed.
+        if _ai_sync():
+            _ai_sync()._pending_spawns.clear()
+        if _event_sync():
+            _event_sync()._pending_events.clear()
         lastKnownMap = currentMap
 
 
         if currentMap:
+            sceneReady = true
+            _recover_tracked_ai()
             pendingSceneScan = 1.0
+            pendingSecondScan = 5.0
 
             if _net().IsActive() && multiplayer.multiplayer_peer && multiplayer.multiplayer_peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED:
                 if multiplayer.is_server():
                     pendingHostSceneName = currentMap.get("mapName") if currentMap.get("mapName") else ""
-                    pendingHostReady = 3.0
+                    pendingHostReady = HOST_READY_BROADCAST_DELAY
+                    # keep drain paused for the 3s broadcast-wait window (host's own Compiler.Spawn already cleared isTransitioning at this point)
+                    gameData.isTransitioning = true
                     print("[PlayerManager] Host entered scene: " + pendingHostSceneName + " (broadcasting in 3s)")
                 else:
                     if pendingSpawnPosition != Vector3.ZERO:
-                        var controller = GetLocalController()
-                        if controller:
-                            controller.global_position = pendingSpawnPosition
-                            print("[PlayerManager] Client spawned near host at " + str(pendingSpawnPosition))
+                        _coop_apply_client_spawn(pendingSpawnPosition)
                         pendingSpawnPosition = Vector3.ZERO
-                    RequestAISync.rpc_id(1)
+                    print("[PlayerManager] Client scene-change sync: requesting AI + loot manifest from host")
+                    _ai_sync().RequestAISync.rpc_id(1)
+                    RequestSceneLootSync.rpc_id(1)
+                    _event_sync().RequestFireSync.rpc_id(1)
+                    _event_sync().RequestRadioTVSync.rpc_id(1)
+                    _interactable_sync().RequestDoorSync.rpc_id(1)
+                    pendingSecondLootSync = CLIENT_RESYNC_DELAY
 
 
     if pendingHostReady > 0.0:
@@ -896,9 +1027,12 @@ func ScanIfNeeded(delta: float):
         if pendingHostReady <= 0.0:
             var controller = GetLocalController()
             var hostPos = controller.global_position if controller else Vector3.ZERO
-            print("[PlayerManager] Broadcasting HostSceneReady: " + pendingHostSceneName + " at " + str(hostPos))
-            HostSceneReady.rpc(pendingHostSceneName, hostPos)
+            _ensure_session_seed()
+            print("[PlayerManager] Broadcasting HostSceneReady: " + pendingHostSceneName + " at " + str(hostPos) + " seed=" + str(coopSessionSeed))
+            HostSceneReady.rpc(pendingHostSceneName, hostPos, coopSessionSeed)
             pendingHostSceneName = ""
+            # broadcast-wait window ended; resume drain on host
+            gameData.isTransitioning = false
 
 
     if pendingSceneScan > 0.0:
@@ -907,6 +1041,78 @@ func ScanIfNeeded(delta: float):
 
         if pendingSceneScan <= 0.0:
             RegisterSceneItems()
+            RegisterSceneContainers()
+            if multiplayer.is_server():
+                pendingLootBroadcast = LOOT_MANIFEST_DELAY
+
+
+    if pendingSecondScan > 0.0:
+
+        pendingSecondScan -= delta
+
+        if pendingSecondScan <= 0.0:
+            RegisterSceneItems()
+            RegisterSceneContainers()
+            if multiplayer.is_server():
+                pendingLootBroadcast = LOOT_MANIFEST_DELAY
+
+
+    if pendingLootBroadcast > 0.0:
+
+        pendingLootBroadcast -= delta
+
+        if pendingLootBroadcast <= 0.0:
+            _broadcast_scene_loot_manifest()
+
+
+    if pendingSecondLootSync > 0.0:
+
+        pendingSecondLootSync -= delta
+
+        if pendingSecondLootSync <= 0.0:
+            if _net().IsActive() and !multiplayer.is_server():
+                RequestSceneLootSync.rpc_id(1)
+                _event_sync().RequestFireSync.rpc_id(1)
+                _event_sync().RequestRadioTVSync.rpc_id(1)
+                _interactable_sync().RequestDoorSync.rpc_id(1)
+
+
+func _recover_tracked_ai():
+    var scene = get_tree().current_scene
+    if !scene:
+        return
+    var aiSpawner = scene.get_node_or_null("AI")
+    if !aiSpawner:
+        return
+    var agents = aiSpawner.get_node_or_null("Agents")
+    if !agents:
+        return
+    var recovered = 0
+    for agent in agents.get_children():
+        if !is_instance_valid(agent):
+            continue
+        if !agent.has_meta("network_uuid"):
+            continue
+        var uuid = int(agent.get_meta("network_uuid"))
+        if !worldAI.has(uuid):
+            worldAI[uuid] = agent
+            if uuid >= nextAiUuid:
+                nextAiUuid = uuid + 1
+            recovered += 1
+    if recovered > 0:
+        print("[PlayerManager] Recovered " + str(recovered) + " AI that were spawned before ScanIfNeeded")
+
+
+func _is_trader_display_item(node: Node) -> bool:
+    if !node:
+        return false
+    var parent: Node = node.get_parent()
+    while parent:
+        var script = parent.get_script()
+        if script and str(script.resource_path).ends_with("TraderDisplay.gd"):
+            return true
+        parent = parent.get_parent()
+    return false
 
 
 func RegisterSceneItems():
@@ -917,19 +1123,375 @@ func RegisterSceneItems():
     items.sort_custom(func(a, b): return str(a.get_path()) < str(b.get_path()))
 
 
-    var uuid = 0
+    var registered = 0
 
     for item in items:
         if item is Pickup:
-            item.set_meta("network_uuid", uuid)
-            worldItems[uuid] = item
-            uuid += 1
+            if item.has_meta("network_uuid"):
+                continue
+            if _is_trader_display_item(item):
+                continue
+            item.set_meta("network_uuid", nextUuid)
+            worldItems[nextUuid] = item
+            nextUuid += 1
+            registered += 1
 
 
-    nextUuid = uuid
+    print("PlayerManager: registered " + str(registered) + " new scene items (total " + str(worldItems.size()) + ")")
 
 
-    print("PlayerManager: registered " + str(uuid) + " scene items")
+func RegisterSceneContainers():
+    var seen: Dictionary = {}
+    var added: int = 0
+    for collider in get_tree().get_nodes_in_group("Interactable"):
+        if !is_instance_valid(collider):
+            continue
+        var node: Node = collider
+        var root: LootContainer = null
+        while node:
+            if node is LootContainer:
+                root = node
+                break
+            node = node.get_parent()
+        if !root or seen.has(root):
+            continue
+        seen[root] = true
+        if !root.is_in_group("CoopLootContainer"):
+            root.add_to_group("CoopLootContainer")
+            added += 1
+    print("PlayerManager: registered " + str(seen.size()) + " containers (" + str(added) + " newly added to group)")
+
+
+func _coop_apply_client_spawn(host_pos: Vector3) -> void:
+    var controller = GetLocalController()
+    if !controller:
+        return
+    controller.global_position = host_pos
+    controller.velocity = Vector3.ZERO
+    print("[PlayerManager] Client spawn: host=" + str(host_pos))
+
+
+# ─── Scene loot manifest ─────────────────────────────────────────────────────
+
+func _broadcast_scene_loot_manifest():
+    if !multiplayer.is_server():
+        return
+    var map = GetMap()
+    if !map:
+        return
+    var mapName: String = str(map.get("mapName")) if map.get("mapName") else ""
+    var manifest = _build_scene_loot_manifest()
+    print("[PlayerManager] Broadcasting scene loot manifest for " + mapName + ": " + str(manifest.items.size()) + " items, " + str(manifest.containers.size()) + " containers, " + str(manifest.furniture.size()) + " furniture")
+    ApplySceneLootManifest.rpc(mapName, manifest.items, manifest.containers, manifest.furniture)
+
+
+func _build_scene_loot_manifest() -> Dictionary:
+    var items: Array = []
+    for uuid in worldItems:
+        var pickup = worldItems[uuid]
+        if !is_instance_valid(pickup):
+            continue
+        if !pickup.slotData or !pickup.slotData.itemData:
+            continue
+        if _is_inside_skeleton(pickup):
+            continue
+        items.append({
+            "uuid": uuid,
+            "file": pickup.slotData.itemData.file,
+            "pos": pickup.global_position,
+            "rot": pickup.global_rotation,
+            "slotDict": SerializeSlotData(pickup.slotData),
+        })
+
+    var furniture: Array = []
+    for root in _coop_iter_furniture_roots():
+        var component = _coop_find_furniture_component(root)
+        if !component or !component.itemData:
+            continue
+        var fid: int
+        if root.has_meta("coop_furniture_id"):
+            fid = int(root.get_meta("coop_furniture_id"))
+        else:
+            fid = nextFurnitureId
+            nextFurnitureId += 1
+            root.set_meta("coop_furniture_id", fid)
+            worldFurniture[fid] = root
+            if root is LootContainer:
+                root.set_meta("coop_container_id", fid)
+        furniture.append({
+            "fid": fid,
+            "file": component.itemData.file,
+            "pos": root.global_position,
+            "rot": root.global_rotation,
+            "scale": root.scale,
+        })
+
+    var container_set: Dictionary = {}
+    for container in get_tree().get_nodes_in_group("CoopLootContainer"):
+        if !is_instance_valid(container):
+            continue
+        if container.containerName == "Corpse":
+            continue
+        container_set[_coop_container_id(container)] = container
+
+    for collider in get_tree().get_nodes_in_group("Interactable"):
+        if !is_instance_valid(collider):
+            continue
+        var node: Node = collider
+        while node:
+            if node is LootContainer:
+                var cid = _coop_container_id(node)
+                if !container_set.has(cid) and node.containerName != "Corpse":
+                    container_set[cid] = node
+                    if !node.is_in_group("CoopLootContainer"):
+                        node.add_to_group("CoopLootContainer")
+                break
+            node = node.get_parent()
+
+    var containers: Array = []
+    for cid in container_set:
+        var container = container_set[cid]
+        var content = container.storage if container.storaged else container.loot
+        var serialized: Array = []
+        for slot in content:
+            serialized.append(SerializeSlotData(slot))
+        containers.append({
+            "id": cid,
+            "loot": serialized,
+            "storaged": container.storaged,
+            "visible": container.visible,
+            "disabled": container.process_mode == Node.PROCESS_MODE_DISABLED,
+        })
+
+    print("[PlayerManager] Manifest built: " + str(items.size()) + " items, " + str(containers.size()) + " containers, " + str(furniture.size()) + " furniture (fids=" + str(furniture.map(func(f): return f.fid)) + ")")
+    return {"items": items, "containers": containers, "furniture": furniture}
+
+
+func _coop_iter_furniture_roots() -> Array:
+    return _furniture_sync()._coop_iter_furniture_roots()
+
+func _coop_find_furniture_component(root: Node) -> Furniture:
+    return _furniture_sync()._coop_find_furniture_component(root)
+
+func _find_furniture_by_id(fid: int) -> Node3D:
+    return _furniture_sync()._find_furniture_by_id(fid)
+
+
+const COOP_POS_HASH_SNAP: float = 0.1
+
+
+func CoopPosHash(pos: Vector3) -> int:
+    return hash(Vector3(
+        snappedf(pos.x, COOP_POS_HASH_SNAP),
+        snappedf(pos.y, COOP_POS_HASH_SNAP),
+        snappedf(pos.z, COOP_POS_HASH_SNAP)
+    ))
+
+
+func CoopSeedForNode(node: Node3D) -> int:
+    if !multiplayer.is_server():
+        while coopSessionSeed == 0:
+            if !_net() or !_net().IsActive():
+                return 0
+            await get_tree().process_frame
+    return CoopPosHash(node.global_position) ^ _ensure_session_seed()
+
+
+func _coop_container_id(container) -> int:
+    if container.has_meta("coop_container_id"):
+        return int(container.get_meta("coop_container_id"))
+    return CoopPosHash(container.global_position)
+
+
+func _is_inside_skeleton(node: Node) -> bool:
+    var parent = node.get_parent()
+    while parent:
+        if parent is Skeleton3D:
+            return true
+        parent = parent.get_parent()
+    return false
+
+
+@rpc("any_peer", "reliable", "call_remote")
+func RequestSceneLootSync():
+    if !multiplayer.is_server():
+        return
+    var map = GetMap()
+    if !map:
+        return
+    var mapName: String = str(map.get("mapName")) if map.get("mapName") else ""
+    var sender = multiplayer.get_remote_sender_id()
+    var manifest = _build_scene_loot_manifest()
+    print("[PlayerManager] Sending scene loot manifest to peer " + str(sender) + " for " + mapName + ": " + str(manifest.items.size()) + " items, " + str(manifest.containers.size()) + " containers, " + str(manifest.furniture.size()) + " furniture")
+    ApplySceneLootManifest.rpc_id(sender, mapName, manifest.items, manifest.containers, manifest.furniture)
+
+
+@rpc("authority", "reliable", "call_remote")
+func ApplySceneLootManifest(sceneName: String, items: Array, containers: Array, furniture: Array = []):
+    print("[PlayerManager] Received loot manifest for " + sceneName + ": " + str(items.size()) + " items, " + str(containers.size()) + " containers, " + str(furniture.size()) + " furniture")
+    var map = GetMap()
+    if !map:
+        print("[PlayerManager] Ignoring loot manifest — no map loaded")
+        return
+    var currentSceneName: String = str(map.get("mapName")) if map.get("mapName") else ""
+    if currentSceneName != sceneName:
+        print("[PlayerManager] Ignoring loot manifest for " + sceneName + " (currently in " + currentSceneName + ")")
+        return
+
+    var manifest_uuids: Dictionary = {}
+    for item_data in items:
+        manifest_uuids[int(item_data.get("uuid", -1))] = true
+
+    for pickup in get_tree().get_nodes_in_group("Item"):
+        if !(pickup is Pickup):
+            continue
+        if _is_inside_skeleton(pickup):
+            continue
+        if _is_trader_display_item(pickup):
+            continue
+        var keep: bool = false
+        if pickup.has_meta("network_uuid"):
+            var existing_uuid: int = int(pickup.get_meta("network_uuid"))
+            if manifest_uuids.has(existing_uuid):
+                keep = true
+        if !keep:
+            pickup.queue_free()
+
+    var manifest_fids: Dictionary = {}
+    for entry in furniture:
+        manifest_fids[int(entry.get("fid", -1))] = true
+
+    if furniture.size() > 0:
+        for root in _coop_iter_furniture_roots():
+            var keep: bool = false
+            if root.has_meta("coop_furniture_id"):
+                var existing_fid: int = int(root.get_meta("coop_furniture_id"))
+                if manifest_fids.has(existing_fid):
+                    keep = true
+            if !keep:
+                root.queue_free()
+        for fid in worldFurniture.keys().duplicate():
+            if !manifest_fids.has(fid) or !is_instance_valid(worldFurniture[fid]):
+                worldFurniture.erase(fid)
+
+    await get_tree().process_frame
+
+    for uuid in worldItems.keys().duplicate():
+        var existing = worldItems[uuid]
+        if !is_instance_valid(existing):
+            worldItems.erase(uuid)
+
+    for item_data in items:
+        _spawn_manifest_item(map, item_data)
+
+    for furniture_entry in furniture:
+        _spawn_manifest_furniture(map, furniture_entry)
+
+    var container_lookup: Dictionary = {}
+    for container in get_tree().get_nodes_in_group("CoopLootContainer"):
+        if !is_instance_valid(container):
+            continue
+        if container.containerName == "Corpse":
+            continue
+        container_lookup[_coop_container_id(container)] = container
+
+    # Also walk Interactable group for containers not yet in CoopLootContainer - fixes bullshittery
+    for collider in get_tree().get_nodes_in_group("Interactable"):
+        if !is_instance_valid(collider):
+            continue
+        var node: Node = collider
+        while node:
+            if node is LootContainer:
+                var cid = _coop_container_id(node)
+                if !container_lookup.has(cid) and node.containerName != "Corpse":
+                    container_lookup[cid] = node
+                    if !node.is_in_group("CoopLootContainer"):
+                        node.add_to_group("CoopLootContainer")
+                break
+            node = node.get_parent()
+
+    var matched_containers = 0
+    for container_data in containers:
+        var cid: int = container_data.get("id", 0)
+        if !container_lookup.has(cid):
+            continue
+        var container = container_lookup[cid]
+        var serialized: Array = container_data.get("loot", [])
+        var storaged: bool = container_data.get("storaged", false)
+        if storaged:
+            container.storage.clear()
+            for dict in serialized:
+                var slot = DeserializeSlotData(dict)
+                if slot:
+                    container.storage.append(slot)
+            container.storaged = true
+        else:
+            container.loot.clear()
+            for dict in serialized:
+                var slot = DeserializeSlotData(dict)
+                if slot:
+                    container.loot.append(slot)
+        if container_data.has("visible"):
+            container.visible = bool(container_data.get("visible", true))
+        if container_data.has("disabled"):
+            var should_disable: bool = bool(container_data.get("disabled", false))
+            container.process_mode = Node.PROCESS_MODE_DISABLED if should_disable else Node.PROCESS_MODE_INHERIT
+        matched_containers += 1
+
+    print("[PlayerManager] Applied scene loot manifest: " + str(items.size()) + " items, " + str(matched_containers) + "/" + str(containers.size()) + " containers, " + str(furniture.size()) + " furniture")
+
+
+func _spawn_manifest_item(map: Node, item_data: Dictionary):
+    var file: String = item_data.get("file", "")
+    if file == "":
+        return
+    var uuid: int = item_data.get("uuid", -1)
+    if uuid >= 0 and worldItems.has(uuid) and is_instance_valid(worldItems[uuid]):
+        var existing = worldItems[uuid]
+        existing.global_position = item_data.get("pos", existing.global_position)
+        existing.global_rotation = item_data.get("rot", existing.global_rotation)
+        var slotDictExisting: Dictionary = item_data.get("slotDict", {})
+        if slotDictExisting.size() > 0:
+            _apply_slot_dict_to_pickup(existing, slotDictExisting)
+        return
+    var scene = Database.get(file)
+    if !scene:
+        push_warning("[PlayerManager] Manifest item not in Database: " + file + " — peer may be missing a mod")
+        return
+
+    var pickup = scene.instantiate()
+    map.add_child(pickup)
+    pickup.global_position = item_data.get("pos", Vector3.ZERO)
+    pickup.global_rotation = item_data.get("rot", Vector3.ZERO)
+
+    var slotDict: Dictionary = item_data.get("slotDict", {})
+    if slotDict.size() > 0:
+        _apply_slot_dict_to_pickup(pickup, slotDict)
+
+    pickup.freeze = true
+
+    if uuid >= 0:
+        pickup.set_meta("network_uuid", uuid)
+        worldItems[uuid] = pickup
+        if uuid >= nextUuid:
+            nextUuid = uuid + 1
+
+
+func _spawn_manifest_furniture(_map: Node, entry: Dictionary):
+    var fid: int = int(entry.get("fid", -1))
+    if fid < 0:
+        return
+    var file: String = entry.get("file", "")
+    if Database.get(file) == null:
+        push_warning("[PlayerManager] Manifest furniture not in Database: " + file + " — peer may be missing a mod")
+        return
+    _furniture_sync().BroadcastFurnitureSpawn(
+        fid,
+        file,
+        entry.get("pos", Vector3.ZERO),
+        entry.get("rot", Vector3.ZERO),
+        entry.get("scale", Vector3.ONE)
+    )
 
 
 func GenerateUuid() -> int:
@@ -938,86 +1500,71 @@ func GenerateUuid() -> int:
     return u
 
 
+func GenerateFurnitureId() -> int:
+    var f = nextFurnitureId
+    nextFurnitureId += 1
+    return f
+
+func NextFurnitureToken() -> int:
+    return _furniture_sync().NextFurnitureToken()
+
+
 func RequestPickup(uuid: int):
 
     if !_net().IsActive():
         return
 
-
-    if multiplayer.is_server():
-
-        if !worldItems.has(uuid):
-            return
-
-
-        var pickup = worldItems[uuid]
-
-        if !is_instance_valid(pickup):
-            worldItems.erase(uuid)
-            return
-
-
-        BroadcastPickupTake.rpc(uuid, multiplayer.get_unique_id())
-
-
-    else:
-
-        RequestPickupTake.rpc_id(1, uuid, multiplayer.get_unique_id())
-
-
-@rpc("any_peer", "reliable", "call_remote")
-func RequestPickupTake(uuid: int, peerId: int):
-
-    if !multiplayer.is_server():
-        return
-
-
     if !worldItems.has(uuid):
         return
 
-
     var pickup = worldItems[uuid]
-
     if !is_instance_valid(pickup):
         worldItems.erase(uuid)
         return
 
-
-    BroadcastPickupTake.rpc(uuid, peerId)
-
-
-@rpc("authority", "reliable", "call_local")
-func BroadcastPickupTake(uuid: int, peerId: int):
-
-    if !worldItems.has(uuid):
+    var iface = GetLocalInterface()
+    if !iface:
         return
 
+    var added: bool = false
+    if iface.AutoStack(pickup.slotData, iface.inventoryGrid):
+        added = true
+    elif iface.Create(pickup.slotData, iface.inventoryGrid, false):
+        added = true
 
-    var pickup = worldItems[uuid]
-
-    if !is_instance_valid(pickup):
-        worldItems.erase(uuid)
+    if !added:
+        if iface.has_method("PlayError"):
+            iface.PlayError()
         return
 
-
-    if peerId == multiplayer.get_unique_id():
-
-        var iface = GetLocalInterface()
-
-        if iface:
-
-            if !iface.AutoStack(pickup.slotData, iface.inventoryGrid):
-                iface.Create(pickup.slotData, iface.inventoryGrid, false)
-
-            iface.UpdateStats(false)
-
-
-            if pickup.has_method("PlayPickup"):
-                pickup.PlayPickup()
-
+    iface.UpdateStats(false)
+    if pickup.has_method("PlayPickup"):
+        pickup.PlayPickup()
 
     worldItems.erase(uuid)
     pickup.queue_free()
+
+    if multiplayer.is_server():
+        BroadcastPickupRemove.rpc(uuid)
+    else:
+        SubmitPickupRemove.rpc_id(1, uuid)
+
+
+@rpc("any_peer", "reliable", "call_remote")
+func SubmitPickupRemove(uuid: int):
+    if !multiplayer.is_server():
+        return
+    BroadcastPickupRemove.rpc(uuid)
+
+
+@rpc("authority", "reliable", "call_local")
+func BroadcastPickupRemove(uuid: int):
+    if !worldItems.has(uuid):
+        return
+    var pickup = worldItems[uuid]
+    if is_instance_valid(pickup):
+        pickup.queue_free()
+    worldItems.erase(uuid)
 
 
 func RequestPickupSpawn(slotDict: Dictionary, pos: Vector3, rotDeg: Vector3, vel: Vector3):
@@ -1044,6 +1591,81 @@ func SubmitPickupSpawn(slotDict: Dictionary, pos: Vector3, rotDeg: Vector3, vel:
     BroadcastPickupSpawn.rpc(uuid, slotDict, pos, rotDeg, vel)
 
 
+signal placement_token_received(token: int, uuid: int)
+var _next_placement_token: int = 0
+
+
+func NextPlacementToken() -> int:
+    _next_placement_token += 1
+    return _next_placement_token
+
+
+@rpc("authority", "reliable", "call_remote")
+func BroadcastPickupMove(uuid: int, pos: Vector3, rot: Vector3, frozen: bool = true):
+    _pickup_targets[uuid] = {"pos": pos, "rot": rot, "frozen": frozen}
+
+
+@rpc("any_peer", "reliable", "call_remote")
+func SubmitPickupMove(uuid: int, pos: Vector3, rot: Vector3, frozen: bool = true):
+    if !multiplayer.is_server():
+        return
+    _pickup_targets[uuid] = {"pos": pos, "rot": rot, "frozen": frozen}
+    BroadcastPickupMove.rpc(uuid, pos, rot, frozen)
+
+
+const PICKUP_LERP_EPSILON: float = 0.01
+
+
+func _lerp_pickup_targets(delta: float):
+    if _pickup_targets.is_empty():
+        return
+    var t: float = clampf(PICKUP_LERP_SPEED * delta, 0.0, 1.0)
+    var stale: Array = []
+    for uuid in _pickup_targets:
+        if !worldItems.has(uuid):
+            stale.append(uuid)
+            continue
+        var pickup = worldItems[uuid]
+        if !is_instance_valid(pickup):
+            stale.append(uuid)
+            continue
+        var target: Dictionary = _pickup_targets[uuid]
+        if target.frozen and pickup.global_position.distance_to(target.pos) < PICKUP_LERP_EPSILON:
+            pickup.global_position = target.pos
+            pickup.global_rotation = target.rot
+            pickup.freeze = true
+            stale.append(uuid)
+            continue
+        pickup.global_position = pickup.global_position.lerp(target.pos, t)
+        pickup.global_rotation.x = lerp_angle(pickup.global_rotation.x, target.rot.x, t)
+        pickup.global_rotation.y = lerp_angle(pickup.global_rotation.y, target.rot.y, t)
+        pickup.global_rotation.z = lerp_angle(pickup.global_rotation.z, target.rot.z, t)
+        if target.frozen:
+            pickup.freeze = true
+        else:
+            if pickup.has_method("Unfreeze"):
+                pickup.Unfreeze()
+            else:
+                pickup.freeze = false
+    for u in stale:
+        _pickup_targets.erase(u)
+
+
+@rpc("any_peer", "reliable", "call_remote")
+func RequestPlacementSpawn(token: int, slotDict: Dictionary, initialPos: Vector3):
+    if !multiplayer.is_server():
+        return
+    var sender = multiplayer.get_remote_sender_id()
+    var uuid = GenerateUuid()
+    BroadcastPickupSpawn.rpc(uuid, slotDict, initialPos, Vector3.ZERO, Vector3.ZERO)
+    DeliverPlacementToken.rpc_id(sender, token, uuid)
+
+
+@rpc("authority", "reliable", "call_remote")
+func DeliverPlacementToken(token: int, uuid: int):
+    placement_token_received.emit(token, uuid)
+
+
 @rpc("authority", "reliable", "call_local")
 func BroadcastPickupSpawn(uuid: int, slotDict: Dictionary, pos: Vector3, rotDeg: Vector3, vel: Vector3):
 
@@ -1056,7 +1678,7 @@ func BroadcastPickupSpawn(uuid: int, slotDict: Dictionary, pos: Vector3, rotDeg:
     var scene = Database.get(file)
 
     if !scene:
-        print("PlayerManager: no Database entry for " + file)
+        push_warning("[PlayerManager] Pickup not in Database: " + file + " — peer may be missing a mod")
         return
 
 
@@ -1076,24 +1698,7 @@ func BroadcastPickupSpawn(uuid: int, slotDict: Dictionary, pos: Vector3, rotDeg:
     pickup.Unfreeze()
 
 
-    pickup.slotData.amount = slotDict.get("amount", pickup.slotData.amount)
-    pickup.slotData.condition = slotDict.get("condition", pickup.slotData.condition)
-    pickup.slotData.state = slotDict.get("state", pickup.slotData.state)
-    pickup.slotData.chamber = slotDict.get("chamber", pickup.slotData.chamber)
-    pickup.slotData.casing = slotDict.get("casing", pickup.slotData.casing)
-    pickup.slotData.mode = slotDict.get("mode", pickup.slotData.mode)
-    pickup.slotData.zoom = slotDict.get("zoom", pickup.slotData.zoom)
-    pickup.slotData.position = slotDict.get("position", pickup.slotData.position)
-
-
-    pickup.slotData.nested.clear()
-    for nestedFile in slotDict.get("nested", []):
-        var nestedData = LookupItemData(nestedFile)
-        if nestedData:
-            pickup.slotData.nested.append(nestedData)
-
-
-    pickup.UpdateAttachments()
+    _apply_slot_dict_to_pickup(pickup, slotDict)
 
 
     pickup.set_meta("network_uuid", uuid)
@@ -1110,220 +1715,33 @@ func ShouldGenerateLoot() -> bool:
     return multiplayer.is_server()
 
 
-@rpc("any_peer", "reliable", "call_remote")
-func RequestContainerOpen(containerPath: NodePath):
-
-    if !multiplayer.is_server():
-        return
-
-
-    var container = get_node_or_null(containerPath)
-
-    if !container || !(container is LootContainer):
-        return
-
-
-    var sender = multiplayer.get_remote_sender_id()
-    var serialized: Array = []
-
-
-    var source = container.storage if container.storaged else container.loot
-
-    for slot in source:
-        serialized.append(SerializeSlotData(slot))
-
-
-    DeliverContainerLoot.rpc_id(sender, containerPath, serialized, container.storaged)
-
-
-@rpc("authority", "reliable", "call_remote")
-func DeliverContainerLoot(containerPath: NodePath, serialized: Array, isStoraged: bool):
-
-    var container = get_node_or_null(containerPath)
-
-    if !container || !(container is LootContainer):
-        return
-
-
-    if isStoraged:
-        container.storage.clear()
-        for dict in serialized:
-            container.storage.append(DeserializeSlotData(dict))
-        container.storaged = true
-    else:
-        container.loot.clear()
-        for dict in serialized:
-            container.loot.append(DeserializeSlotData(dict))
-
-
-    var UIManager = get_tree().current_scene.get_node_or_null("Core/UI")
-
-    if UIManager:
-        UIManager.OpenContainer(container)
-        container.ContainerAudio()
-
+func _find_container_by_id(cid: int) -> LootContainer:
+    return _container_sync()._find_container_by_id(cid)
 
 func SyncContainerStorage(container: LootContainer):
+    _container_sync().SyncContainerStorage(container)
 
-    if !_net().IsActive():
-        return
+func TryOpenContainer(container) -> void:
+    _container_sync().TryOpenContainer(container)
 
-
-    if !container:
-        return
-
-
-    var serialized: Array = []
-
-    for slot in container.storage:
-        serialized.append(SerializeSlotData(slot))
+func ReleaseContainerLock(container) -> void:
+    _container_sync().ReleaseContainerLock(container)
 
 
-    var path = container.get_path()
-
-
-    if multiplayer.is_server():
-        BroadcastContainerStorage.rpc(path, serialized)
-    else:
-        SubmitContainerStorage.rpc_id(1, path, serialized)
-
-
-@rpc("any_peer", "reliable", "call_remote")
-func SubmitContainerStorage(containerPath: NodePath, serialized: Array):
-
-    if !multiplayer.is_server():
-        return
-
-
-    var container = get_node_or_null(containerPath)
-
-    if !container || !(container is LootContainer):
-        return
-
-
-    container.storage.clear()
-
-    for dict in serialized:
-        container.storage.append(DeserializeSlotData(dict))
-
-    container.storaged = true
-
-
-    BroadcastContainerStorage.rpc(containerPath, serialized)
-
-
-@rpc("authority", "reliable", "call_remote")
-func BroadcastContainerStorage(containerPath: NodePath, serialized: Array):
-
-    var container = get_node_or_null(containerPath)
-
-    if !container || !(container is LootContainer):
-        return
-
-
-    container.storage.clear()
-
-    for dict in serialized:
-        container.storage.append(DeserializeSlotData(dict))
-
-    container.storaged = true
+func _slot_serializer() -> Node:
+    return get_node_or_null("SlotSerializer")
 
 
 func SerializeSlotData(slot: SlotData) -> Dictionary:
-
-    if !slot || !slot.itemData:
-        return {}
-
-
-    var nestedFiles: Array = []
-    for item in slot.nested:
-        if item:
-            nestedFiles.append(item.file)
-
-
-    return {
-        "file": slot.itemData.file,
-        "amount": slot.amount,
-        "condition": slot.condition,
-        "state": slot.state,
-        "rotated": slot.gridRotated,
-        "gridPosition": slot.gridPosition,
-        "position": slot.position,
-        "mode": slot.mode,
-        "zoom": slot.zoom,
-        "chamber": slot.chamber,
-        "casing": slot.casing,
-        "nested": nestedFiles,
-    }
+    return _slot_serializer().SerializeSlotData(slot)
 
 
 func DeserializeSlotData(dict: Dictionary) -> SlotData:
-
-    var slot = SlotData.new()
-    var file = dict.get("file", "")
-
-
-    if file == "":
-        return slot
-
-
-    slot.itemData = LookupItemData(file)
-    slot.amount = dict.get("amount", 0)
-    slot.condition = dict.get("condition", 100)
-    slot.state = dict.get("state", "")
-    slot.gridRotated = dict.get("rotated", false)
-    slot.gridPosition = dict.get("gridPosition", Vector2.ZERO)
-    slot.position = dict.get("position", 0)
-    slot.mode = dict.get("mode", 1)
-    slot.zoom = dict.get("zoom", 1)
-    slot.chamber = dict.get("chamber", false)
-    slot.casing = dict.get("casing", false)
-
-
-    for nestedFile in dict.get("nested", []):
-        var nestedData = LookupItemData(nestedFile)
-        if nestedData:
-            slot.nested.append(nestedData)
-
-
-    return slot
-
-
-var itemDataCache: Dictionary = {}
+    return _slot_serializer().DeserializeSlotData(dict)
 
 
 func LookupItemData(file: String) -> ItemData:
-
-    if file == "":
-        return null
-
-
-    if itemDataCache.has(file):
-        return itemDataCache[file]
-
-
-    var scene = Database.get(file)
-
-    if !scene:
-        return null
-
-
-    var temp = scene.instantiate()
-    var data = null
-
-
-    if "slotData" in temp && temp.slotData && temp.slotData.itemData:
-        data = temp.slotData.itemData
-
-
-    temp.queue_free()
-
-
-    if data:
-        itemDataCache[file] = data
-
-
-    return data
+    return _slot_serializer().LookupItemData(file)
 
 
 @rpc("authority", "unreliable", "call_remote")
@@ -1347,398 +1765,113 @@ func BroadcastSimulationState(time: float, day: int, weather: String, weatherTim
 
 var worldAI: Dictionary = {}
 var nextAiUuid: int = 0
-var aiTargets: Dictionary = {}  # uuid → {pos: Vector3, rot: Vector3}
-const AI_LERP_SPEED = 18.0
+var aiTargets: Dictionary = {}
 
 
 var pendingSceneChange: String = ""
 var pendingSceneTimer: float = 0.0
-# Long enough to accommodate load times. Firing earlier
-# would race the host's HostSceneReady RPC and cause a double scene-load.
 const SCENE_CHANGE_TIMEOUT = 90.0
 
 
 func GenerateAiUuid() -> int:
-    var u = nextAiUuid
-    nextAiUuid += 1
-    return u
-
+    return _ai_sync().GenerateAiUuid()
 
 func GetNearestPlayerPosition(from: Vector3) -> Vector3:
-
-    var nearest = Vector3.ZERO
-    var bestDist = INF
-    var found = false
-
-
-    var localCtrl = GetLocalController()
-    if localCtrl && localCtrl.is_inside_tree():
-        var d = from.distance_squared_to(localCtrl.global_position)
-        if d < bestDist:
-            bestDist = d
-            nearest = localCtrl.global_position
-            found = true
-
-
-    for id in remotePlayers:
-        var puppet = remotePlayers[id]
-        if !is_instance_valid(puppet) || !puppet.is_inside_tree():
-            continue
-        var d = from.distance_squared_to(puppet.global_position)
-        if d < bestDist:
-            bestDist = d
-            nearest = puppet.global_position
-            found = true
-
-
-    return nearest if found else Vector3.ZERO
-
+    return _ai_sync().GetNearestPlayerPosition(from)
 
 func GetNearestPlayerCamera(from: Vector3) -> Vector3:
+    return _ai_sync().GetNearestPlayerCamera(from)
 
-    var nearestCam = Vector3.ZERO
-    var bestDist = INF
-    var found = false
 
+# ─── Sync module forwarders ──────────────────────────────────────────────────
 
-    var localCtrl = GetLocalController()
-    if localCtrl && localCtrl.is_inside_tree():
-        var d = from.distance_squared_to(localCtrl.global_position)
-        if d < bestDist:
-            bestDist = d
-            nearestCam = gameData.cameraPosition
-            found = true
+func _event_sync() -> Node:
+    return get_node_or_null("EventSync")
 
+func _interactable_sync() -> Node:
+    return get_node_or_null("InteractableSync")
 
-    for id in remotePlayers:
-        var puppet = remotePlayers[id]
-        if !is_instance_valid(puppet) || !puppet.is_inside_tree():
-            continue
-        var d = from.distance_squared_to(puppet.global_position)
-        if d < bestDist:
-            bestDist = d
-            nearestCam = puppet.global_position + Vector3(0, 1.6, 0)
-            found = true
+func _container_sync() -> Node:
+    return get_node_or_null("ContainerSync")
 
+func _furniture_sync() -> Node:
+    return get_node_or_null("FurnitureSync")
 
-    return nearestCam if found else Vector3.ZERO
+func _ai_sync() -> Node:
+    return get_node_or_null("AISync")
 
+func _quest_sync() -> Node:
+    return get_node_or_null("QuestSync")
 
-func BroadcastAIPositions():
-
-    if worldAI.is_empty():
-        return
-
-
-    var uuids: Array = []
-    var positions: PackedVector3Array = PackedVector3Array()
-    var rotations: PackedVector3Array = PackedVector3Array()
-    var speeds: PackedFloat32Array = PackedFloat32Array()
-    var aiStates: PackedInt32Array = PackedInt32Array()
-
-
-    for uuid in worldAI:
-        var ai = worldAI[uuid]
-        if !is_instance_valid(ai) || !ai.is_inside_tree():
-            continue
-        uuids.append(uuid)
-        positions.append(ai.global_position)
-        rotations.append(ai.global_rotation)
-        speeds.append(ai.speed)
-        aiStates.append(ai.currentState)
-
-
-    if uuids.size() == 0:
-        return
-
-
-    BroadcastAIStates.rpc(uuids, positions, rotations, speeds, aiStates)
-
-
-@rpc("authority", "unreliable", "call_remote")
-func BroadcastAIStates(uuids: Array, positions: PackedVector3Array, rotations: PackedVector3Array, speeds: PackedFloat32Array, states: PackedInt32Array):
-
-    for i in uuids.size():
-        var uuid = uuids[i]
-        if !worldAI.has(uuid):
-            continue
-        var ai = worldAI[uuid]
-        if !is_instance_valid(ai) || !ai.is_inside_tree():
-            continue
-        aiTargets[uuid] = {"pos": positions[i], "rot": rotations[i]}
-        ai.speed = speeds[i]
-        ai.currentState = states[i]
-
-
-@rpc("authority", "reliable", "call_remote")
-func BroadcastAISpawn(uuid: int, spawnType: String, spawnPointPath: NodePath, variant: Dictionary):
-
-    var scene = get_tree().current_scene
-    if !scene:
-        return
-
-
-    var aiSpawner = scene.get_node_or_null("AI")
-    if !aiSpawner:
-        print("PlayerManager: BroadcastAISpawn but no AI spawner in scene")
-        return
-
-
-    var spawnPoint = get_node_or_null(spawnPointPath)
-    if !spawnPoint:
-        print("PlayerManager: BroadcastAISpawn but spawn point missing: " + str(spawnPointPath))
-        return
-
-
-    if aiSpawner.APool.get_child_count() == 0:
-        print("PlayerManager: BroadcastAISpawn but client APool empty")
-        return
-
-
-    var newAgent = aiSpawner.APool.get_child(0)
-    newAgent.reparent(aiSpawner.agents)
-    newAgent.global_transform = spawnPoint.global_transform
-    newAgent.currentPoint = spawnPoint
-    newAgent.set_meta("network_uuid", uuid)
-
-
-    newAgent.spawnVariant = variant
-
-
-    worldAI[uuid] = newAgent
-    aiSpawner.activeAgents += 1
-
-
-    if spawnType == "Wanderer":
-        newAgent.ActivateWanderer()
-    elif spawnType == "Guard":
-        newAgent.ActivateGuard()
-    elif spawnType == "Hider":
-        newAgent.ActivateHider()
-
-
-    if uuid >= nextAiUuid:
-        nextAiUuid = uuid + 1
-
-
-@rpc("any_peer", "reliable", "call_remote")
-func RequestAISync():
-
-    if !multiplayer.is_server():
-        return
-
-
-    var sender = multiplayer.get_remote_sender_id()
-
-    print("PlayerManager: AI sync requested by peer " + str(sender) + " — sending " + str(worldAI.size()) + " AI")
-
-
-    for uuid in worldAI:
-        var ai = worldAI[uuid]
-        if !is_instance_valid(ai) || !ai.is_inside_tree():
-            continue
-        SyncSingleAI.rpc_id(sender, uuid, ai.global_position, ai.global_rotation, ai.spawnVariant)
-
-
-@rpc("authority", "reliable", "call_remote")
-func SyncSingleAI(uuid: int, pos: Vector3, rot: Vector3, variant: Dictionary):
-
-    if worldAI.has(uuid):
-        return
-
-
-    var scene = get_tree().current_scene
-    if !scene:
-        return
-
-
-    var aiSpawner = scene.get_node_or_null("AI")
-    if !aiSpawner:
-        return
-
-
-    if aiSpawner.APool.get_child_count() == 0:
-        print("PlayerManager: SyncSingleAI but client APool empty")
-        return
-
-
-    var newAgent = aiSpawner.APool.get_child(0)
-    newAgent.reparent(aiSpawner.agents)
-    newAgent.global_position = pos
-    newAgent.global_rotation = rot
-    newAgent.spawnVariant = variant
-    newAgent.set_meta("network_uuid", uuid)
-    worldAI[uuid] = newAgent
-    aiTargets[uuid] = {"pos": pos, "rot": rot}
-    aiSpawner.activeAgents += 1
-
-
-    newAgent.EquipmentSetup()
-    newAgent.Activate()
-
-
-    if uuid >= nextAiUuid:
-        nextAiUuid = uuid + 1
-
-
-    print("PlayerManager: synced AI uuid " + str(uuid))
-
-
-@rpc("authority", "reliable", "call_remote")
-func BroadcastAIDeath(uuid: int, direction: Vector3, force: float, container_loot: Array = [], weapon_dict: Dictionary = {}, backpack_dict: Dictionary = {}, secondary_dict: Dictionary = {}):
-
-    if !worldAI.has(uuid):
-        return
-
-
-    var ai = worldAI[uuid]
-    if !is_instance_valid(ai):
-        worldAI.erase(uuid)
-        return
-
-
-    # Apply the host's authoritative loot to the client AI before ragdoll.
-    if container_loot.size() > 0 and ai.container and ai.container.get_child_count() > 0:
-        var ai_container = ai.container.get_child(0)
-        if ai_container and ai_container is LootContainer:
-            ai_container.loot.clear()
-            for dict in container_loot:
-                ai_container.loot.append(DeserializeSlotData(dict))
-
-    if weapon_dict.size() > 0 and ai.weapon and ai.weapon.slotData:
-        _apply_slot_dict_to_pickup(ai.weapon, weapon_dict)
-
-    if backpack_dict.size() > 0 and ai.backpack and ai.backpack.slotData:
-        _apply_slot_dict_to_pickup(ai.backpack, backpack_dict)
-
-    if secondary_dict.size() > 0 and ai.secondary and ai.secondary.slotData:
-        _apply_slot_dict_to_pickup(ai.secondary, secondary_dict)
-
-    ai.Death(direction, force)
-    worldAI.erase(uuid)
+func _world_sync() -> Node:
+    return get_node_or_null("WorldSync")
 
 
 func _apply_slot_dict_to_pickup(pickup, slotDict: Dictionary):
-    if !pickup or !pickup.slotData:
-        return
-    pickup.slotData.amount = slotDict.get("amount", pickup.slotData.amount)
-    pickup.slotData.condition = slotDict.get("condition", pickup.slotData.condition)
-    pickup.slotData.state = slotDict.get("state", pickup.slotData.state)
-    pickup.slotData.chamber = slotDict.get("chamber", pickup.slotData.chamber)
-    pickup.slotData.casing = slotDict.get("casing", pickup.slotData.casing)
-    pickup.slotData.mode = slotDict.get("mode", pickup.slotData.mode)
-    pickup.slotData.zoom = slotDict.get("zoom", pickup.slotData.zoom)
-    pickup.slotData.position = slotDict.get("position", pickup.slotData.position)
-    pickup.slotData.nested.clear()
-    for nestedFile in slotDict.get("nested", []):
-        var nestedData = LookupItemData(nestedFile)
-        if nestedData:
-            pickup.slotData.nested.append(nestedData)
+    _slot_serializer().ApplySlotDictToPickup(pickup, slotDict)
 
 
 @rpc("any_peer", "reliable", "call_remote")
-func RequestAIDamage(uuid: int, hitbox: String, damage: float):
-
+func SubmitDeathContainer(pos: Vector3, items: Array):
     if !multiplayer.is_server():
         return
-
-
-    if !worldAI.has(uuid):
-        return
-
-
-    var ai = worldAI[uuid]
-
-    if !is_instance_valid(ai):
-        worldAI.erase(uuid)
-        return
-
-
-    ai.WeaponDamage(hitbox, damage)
-
-
-func RequestGrenadeThrow(throwPath: String, handlePath: String, pos: Vector3, rotDeg: Vector3, vel: Vector3, angVel: Vector3):
-
-    if !_net().IsActive():
-        return
-
-    var origin_id = multiplayer.get_unique_id()
-
-    if multiplayer.is_server():
-        BroadcastGrenadeThrow.rpc(origin_id, throwPath, handlePath, pos, rotDeg, vel, angVel)
-    else:
-        SubmitGrenadeThrow.rpc_id(1, throwPath, handlePath, pos, rotDeg, vel, angVel)
-
-
-@rpc("any_peer", "reliable", "call_remote")
-func SubmitGrenadeThrow(throwPath: String, handlePath: String, pos: Vector3, rotDeg: Vector3, vel: Vector3, angVel: Vector3):
-
-    if !multiplayer.is_server():
-        return
-
-    var origin_id = multiplayer.get_remote_sender_id()
-
-    _spawn_grenade_locally(throwPath, handlePath, pos, rotDeg, vel, angVel)
-
-    BroadcastGrenadeThrow.rpc(origin_id, throwPath, handlePath, pos, rotDeg, vel, angVel)
-
-
-@rpc("authority", "reliable", "call_remote")
-func BroadcastGrenadeThrow(origin_id: int, throwPath: String, handlePath: String, pos: Vector3, rotDeg: Vector3, vel: Vector3, angVel: Vector3):
-
-    # The originator already spawned via super() in their local GrenadeRig.
-    if multiplayer.get_unique_id() == origin_id:
-        return
-
-    _spawn_grenade_locally(throwPath, handlePath, pos, rotDeg, vel, angVel)
-
-
-func _spawn_grenade_locally(throwPath: String, handlePath: String, pos: Vector3, rotDeg: Vector3, vel: Vector3, angVel: Vector3):
-
-    var throwScene = load(throwPath)
-    if !throwScene:
-        return
-
-
-    var throwGrenade = throwScene.instantiate()
-    get_tree().get_root().add_child(throwGrenade)
-    throwGrenade.position = pos
-    throwGrenade.rotation_degrees = rotDeg
-    throwGrenade.linear_velocity = vel
-    throwGrenade.angular_velocity = angVel
-
-
-    if handlePath != "":
-        var handleScene = load(handlePath)
-        if handleScene:
-            var throwHandle = handleScene.instantiate()
-            get_tree().get_root().add_child(throwHandle)
-            throwGrenade.handle = throwHandle
-            throwHandle.position = pos
-            throwHandle.rotation_degrees = rotDeg
-            throwHandle.linear_velocity = vel / 2.0
-            throwHandle.angular_velocity = -angVel
-
-
-func RequestPlayerExplosionDamage(targetPeerId: int):
-
-    if !_net().IsActive():
-        return
-
-
-    ApplyPlayerExplosionDamage.rpc(targetPeerId)
+    SpawnDeathContainer.rpc(pos, items)
 
 
 @rpc("authority", "reliable", "call_local")
-func ApplyPlayerExplosionDamage(targetPeerId: int):
-
-    if targetPeerId != multiplayer.get_unique_id():
+func SpawnDeathContainer(pos: Vector3, items: Array):
+    var map = GetMap()
+    if !map:
         return
+    var scene = Database.get("Crate_Military")
+    if !scene:
+        return
+    var container = scene.instantiate()
+    map.add_child(container)
+    container.global_position = pos + Vector3(0, 0.5, 0)
+
+    container.containerSize = Vector2(16, 16)
+    container.loot.clear()
+    container.storage.clear()
+    for dict in items:
+        var slot = DeserializeSlotData(dict)
+        if slot and slot.itemData:
+            container.loot.append(slot)
+    container.storaged = false
+    container.containerName = "Death Stash"
+
+    var mesh = container.get_node_or_null("Mesh")
+    if mesh:
+        mesh.hide()
+
+    var backpack_scene = Database.get("Duffel_Retro")
+    if backpack_scene:
+        var visual = backpack_scene.instantiate()
+        visual.collision_layer = 0
+        visual.collision_mask = 0
+        visual.freeze = true
+        if visual.is_in_group("Item"):
+            visual.remove_from_group("Item")
+        container.add_child(visual)
+
+    if !container.is_in_group("CoopLootContainer"):
+        container.add_to_group("CoopLootContainer")
+
+    print("[PlayerManager] Death container spawned at " + str(pos) + " with " + str(items.size()) + " items")
 
 
-    var character = GetLocalCharacter()
-    if character:
-        character.ExplosionDamage()
+@rpc("any_peer", "reliable", "call_remote")
+func SubmitDeathStashRemove(cid: int):
+    if !multiplayer.is_server():
+        return
+    BroadcastDeathStashRemove.rpc(cid)
+
+
+@rpc("authority", "reliable", "call_local")
+func BroadcastDeathStashRemove(cid: int):
+    var container = _find_container_by_id(cid)
+    if container and container.containerName == "Death Stash":
+        container.queue_free()
 
 
 func NotifyPlayerDeath(peerId: int):

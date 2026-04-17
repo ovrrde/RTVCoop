@@ -1,4 +1,5 @@
-extends "res://Scripts/Simulation.gd"
+extends "res://Scripts/Television.gd"
+
 
 var _net_c: Node
 var _pm_c: Node
@@ -10,7 +11,12 @@ func _pm():
     return _pm_c
 
 
-func _process(delta):
-    if simulate and _net() and _net().IsActive() and !multiplayer.is_server():
+func Interact():
+    var ws = _pm()._world_sync() if _pm() else null
+    if ws and ws.CoopRouteInteractToggle(get_path()):
         return
-    super(delta)
+    super()
+
+
+func _coop_remote_interact():
+    super.Interact()

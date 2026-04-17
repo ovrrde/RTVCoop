@@ -1,5 +1,4 @@
 extends CharacterBody3D
-class_name RemotePlayer
 
 var _pm_c: Node
 func _pm():

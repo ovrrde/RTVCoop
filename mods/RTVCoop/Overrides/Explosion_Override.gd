@@ -11,14 +11,14 @@ func _pm():
 
 
 func CheckOverlap():
-    if _net().IsActive() && !multiplayer.is_server():
+    if _net() and _net().IsActive() and !multiplayer.is_server():
         return
     super()
 
 
 func CheckLOS(target):
     var headPos = target.global_position + Vector3(0, 1.5, 0)
-    if target.get("head") && target.head:
+    if target.get("head") and target.head:
         headPos = target.head.global_position
 
     LOS.look_at(headPos, Vector3.UP, true)
@@ -32,6 +32,6 @@ func CheckLOS(target):
 
 
 func CheckAlert():
-    if _net().IsActive() && !multiplayer.is_server():
+    if _net() and _net().IsActive() and !multiplayer.is_server():
         return
     super()
