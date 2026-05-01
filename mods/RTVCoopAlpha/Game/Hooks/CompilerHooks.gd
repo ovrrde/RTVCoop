@@ -33,6 +33,8 @@ func _coop_client_spawn(compiler: Node) -> void:
 		players.set_meta("coop_loading", true)
 		if players.has_method("LoadClientCharacterBuffer"):
 			await players.LoadClientCharacterBuffer()
+		if players.coopCharacterBuffer == null and players.has_method("GiveClientStarterKit"):
+			await players.GiveClientStarterKit()
 		players.set_meta("coop_loading", false)
 
 	var gd: Resource = load("res://Resources/GameData.tres")

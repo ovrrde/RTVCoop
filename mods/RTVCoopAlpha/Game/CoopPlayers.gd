@@ -11,7 +11,6 @@ const PickupSync = preload("res://mods/RTVCoopAlpha/Game/Sync/PickupSync.gd")
 const RTVCoop = preload("res://mods/RTVCoopAlpha/Game/Coop.gd")
 
 const REMOTE_PLAYER_PATH := "res://mods/RTVCoopAlpha/Scenes/RemotePlayer.tscn"
-const PASSTHROUGH_MAPS := ["Cabin"]
 
 
 signal name_registry_synced(registry: Dictionary)
@@ -154,7 +153,7 @@ func CoopPosHash(pos: Vector3) -> int:
 
 func _make_session_seed() -> int:
 	var t := Time.get_unix_time_from_system()
-	var s: int = int(t) ^ int(t * 1000.0) & 0x7FFFFFFF
+	var s: int = (int(t) ^ int(t * 1000.0)) & 0x7FFFFFFF
 	return s if s != 0 else 1
 
 
@@ -294,6 +293,13 @@ func _on_peer_joined(peer_id: int) -> void:
 	if ds and ds.has_method("push_state_to"):
 		ds.push_state_to(peer_id)
 
+	var fs: Node = coop.get_sync("furniture") if coop else null
+	if fs and fs.has_method("push_state_to"):
+		fs.push_state_to(peer_id)
+
+	if _scene_flow and _scene_flow.has_method("PushLootStateTo"):
+		_scene_flow.PushLootStateTo(peer_id)
+
 	if _buffer:
 		_buffer.TryDeliverTo(peer_id)
 
@@ -325,7 +331,7 @@ func _on_peer_left(peer_id: int) -> void:
 
 func _on_disconnected() -> void:
 	if _buffer and not CoopAuthority.is_host():
-		_buffer.Save()
+		_buffer.Clear()
 	for id in remote_players.keys().duplicate():
 		DespawnPuppet(id)
 	var coop := RTVCoop.get_instance()

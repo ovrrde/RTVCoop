@@ -276,6 +276,11 @@ func SwapWeapon(file: String):
     if !aiInstance || !aiInstance.weapons:
         return
 
+    if _active_fire_audio and is_instance_valid(_active_fire_audio):
+        _active_fire_audio.stop()
+        _active_fire_audio.queue_free()
+        _active_fire_audio = null
+
     for child in aiInstance.weapons.get_children():
         child.queue_free()
 

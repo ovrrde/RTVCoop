@@ -1,8 +1,11 @@
 [mod]
 name="RTV Coop Alpha"
 id="rtv-coop-alpha"
-version="0.1.0"
+version="1.0.0"
 priority=10
+
+[updates]
+modworkshop=56011
 
 [autoload]
 RTVCoopAlpha="res://mods/RTVCoopAlpha/Main.gd"
@@ -54,5 +57,4 @@ RTVCoopAlpha="res://mods/RTVCoopAlpha/Main.gd"
 "res://Scripts/Mine.gd"="res://mods/RTVCoopAlpha/Game/ScriptExtends/Mine_Extend.gd"
 "res://Scripts/Explosion.gd"="res://mods/RTVCoopAlpha/Game/ScriptExtends/Explosion_Extend.gd"
 "res://Scripts/Spawner.gd"="res://mods/RTVCoopAlpha/Game/ScriptExtends/Spawner_Extend.gd"
-"res://Scripts/AI.gd"="res://mods/RTVCoopAlpha/Game/ScriptExtends/AI_Extend.gd"
 "res://Scripts/Layouts.gd"="res://mods/RTVCoopAlpha/Game/ScriptExtends/Layouts_Extend.gd"

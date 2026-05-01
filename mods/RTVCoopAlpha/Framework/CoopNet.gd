@@ -240,7 +240,10 @@ func _notify_event(signal_name: StringName, args: Array) -> void:
 		return
 	if not coop.events.has_signal(signal_name):
 		return
-	coop.events.emit_signal(signal_name, args[0] if args.size() > 0 else null)
+	if args.is_empty():
+		coop.events.emit_signal(signal_name)
+	else:
+		coop.events.emit_signal(signal_name, args[0])
 
 
 func _input(event: InputEvent) -> void:

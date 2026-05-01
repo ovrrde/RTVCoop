@@ -34,6 +34,12 @@ func IsLoading() -> bool:
 	return _loading
 
 
+func Clear() -> void:
+	var path: String = _save_path(multiplayer.get_unique_id())
+	if FileAccess.file_exists(path):
+		DirAccess.remove_absolute(path)
+
+
 func Save() -> void:
 	if _players == null or multiplayer.is_server() or _loading or not _players.scene_ready:
 		return
@@ -260,9 +266,11 @@ func Deserialize(data: Dictionary):
 func TryDeliverTo(peer_id: int) -> void:
 	var path: String = _save_path(peer_id)
 	if not FileAccess.file_exists(path):
+		GrantStarterKit.rpc_id(peer_id)
 		return
 	var character = load(path)
 	if character == null:
+		GrantStarterKit.rpc_id(peer_id)
 		return
 	DeliverCoopSave.rpc_id(peer_id, Serialize(character))
 
@@ -291,6 +299,11 @@ func SubmitClientCharacterData(data: Dictionary) -> void:
 func DeliverCoopSave(data: Dictionary) -> void:
 	if _players:
 		_players.coopCharacterBuffer = Deserialize(data)
+
+
+@rpc("authority", "reliable", "call_remote")
+func GrantStarterKit() -> void:
+	GiveStarterKit()
 
 
 @rpc("authority", "reliable", "call_remote")

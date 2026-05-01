@@ -118,6 +118,12 @@ func _on_local_revived() -> void:
 	gd.freeze = false
 	gd.damage = false
 	gd.impact = false
+	gd.bleeding = false
+	gd.fracture = false
+	gd.burn = false
+	gd.rupture = false
+	gd.headshot = false
+	gd.poisoning = false
 
 	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 	Loader.FadeOut()

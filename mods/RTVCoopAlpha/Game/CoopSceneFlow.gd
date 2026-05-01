@@ -296,6 +296,18 @@ func _build_loot_manifest() -> Array:
 	return manifest
 
 
+func PushLootStateTo(peer_id: int) -> void:
+	if not multiplayer.is_server() or _players == null:
+		return
+	if _players.worldItems.is_empty():
+		RegisterSceneItems()
+		RegisterSceneContainers()
+	var manifest: Array = _build_loot_manifest()
+	if not manifest.is_empty():
+		ApplyLootManifest.rpc_id(peer_id, manifest)
+	_broadcast_container_storage_to(peer_id)
+
+
 func _log(msg: String) -> void:
 	var l = Engine.get_meta("CoopLogger", null)
 	if l: l.log_msg("SceneFlow", msg)
@@ -348,8 +360,6 @@ func _broadcast_runtime_spawns() -> void:
 	if not multiplayer.is_server() or _players == null:
 		return
 	var spawns: Array = []
-	for spawner_node in get_tree().get_nodes_in_group("Interactable"):
-		pass
 	var scene := get_tree().current_scene
 	if scene == null:
 		return

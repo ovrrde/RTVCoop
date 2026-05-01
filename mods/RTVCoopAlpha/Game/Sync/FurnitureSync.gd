@@ -44,6 +44,21 @@ func NextFurnitureToken() -> int:
 	return _next_furniture_token
 
 
+func push_state_to(peer_id: int) -> void:
+	var players := _players()
+	if players == null:
+		return
+	BroadcastClearShelterFurniture.rpc_id(peer_id)
+	for fid in players.worldFurniture:
+		var root: Node = players.worldFurniture[fid]
+		if not is_instance_valid(root) or not root.is_inside_tree():
+			continue
+		var component = _find_component(root)
+		if component == null or not component.itemData:
+			continue
+		BroadcastFurnitureSpawn.rpc_id(peer_id, fid, component.itemData.file, root.global_position, root.global_rotation, root.scale)
+
+
 func _find_furniture_by_id(fid: int) -> Node3D:
 	var players := _players()
 	if players == null:

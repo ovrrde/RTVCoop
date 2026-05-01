@@ -505,6 +505,76 @@ func GetNearestPlayerCamera(from: Vector3) -> Vector3:
 	return _nearest_player(from, true)
 
 
+func GetNearestPlayerState(from: Vector3) -> Dictionary:
+	var players := _players()
+	if players == null:
+		return {}
+	var best_dist: float = INF
+	var best_peer: int = -1
+	var is_local: bool = false
+
+	var local_ctrl: Node = players.GetLocalController() if players.has_method("GetLocalController") else null
+	if local_ctrl and local_ctrl.is_inside_tree():
+		var d: float = from.distance_squared_to(local_ctrl.global_position)
+		if d < best_dist:
+			best_dist = d
+			best_peer = CoopAuthority.local_peer_id()
+			is_local = true
+
+	for id in players.remote_players:
+		var puppet: Node = players.remote_players[id]
+		if not is_instance_valid(puppet) or not puppet.is_inside_tree():
+			continue
+		if puppet.get("isDead") or puppet.get("isDowned"):
+			continue
+		var d: float = from.distance_squared_to(puppet.global_position)
+		if d < best_dist:
+			best_dist = d
+			best_peer = id
+			is_local = false
+
+	if best_peer < 0:
+		return {}
+
+	if is_local:
+		return {
+			"pos": local_ctrl.global_position,
+			"cam": gameData.cameraPosition,
+			"is_running": gameData.isRunning,
+			"is_walking": gameData.isWalking,
+			"is_firing": gameData.isFiring,
+			"player_vector": gameData.playerVector,
+		}
+
+	var puppet: Node = players.remote_players.get(best_peer)
+	if not is_instance_valid(puppet):
+		return {}
+	var coop := RTVCoop.get_instance()
+	var proxy: Node = coop.get_player_proxy(best_peer) if coop else null
+	var p_is_running: bool = false
+	var p_is_walking: bool = false
+	var p_is_firing: bool = false
+	if proxy:
+		p_is_firing = proxy.sync_is_firing
+		var cond: String = proxy.sync_anim_condition
+		var blend: float = proxy.sync_anim_blend
+		if cond == "Movement" or cond == "MovementLow":
+			if blend >= 4.0:
+				p_is_running = true
+			elif blend >= 0.5:
+				p_is_walking = true
+
+	var fwd := Vector3(sin(puppet.global_rotation.y), 0, cos(puppet.global_rotation.y)).normalized()
+	return {
+		"pos": puppet.global_position,
+		"cam": puppet.global_position + Vector3(0, 1.6, 0),
+		"is_running": p_is_running,
+		"is_walking": p_is_walking,
+		"is_firing": p_is_firing,
+		"player_vector": fwd,
+	}
+
+
 func BroadcastAIPositions() -> void:
 	var players := _players()
 	if players == null or players.world_ai.is_empty():

@@ -137,7 +137,7 @@ func _add_child_node(node: Node, node_name: String) -> void:
 
 func _try_load_steam_extension() -> void:
 	if not FileAccess.file_exists(STEAM_EXTENSION_PATH):
-		print("[RTVCoopAlpha] GodotSteam extension not found — local loopback olny")
+		print("[RTVCoopAlpha] GodotSteam extension not found — local loopback only")
 		return
 	if GDExtensionManager.is_extension_loaded(STEAM_EXTENSION_PATH):
 		print("[RTVCoopAlpha] GodotSteam already loaded")
