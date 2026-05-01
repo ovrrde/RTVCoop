@@ -6,6 +6,7 @@ const CoopAuthority = preload("res://mods/RTVCoopAlpha/Framework/CoopAuthority.g
 
 var gameData: Resource = preload("res://Resources/GameData.tres")
 const COOP_DOOR_OPEN_RANGE: float = 40.0
+const COOP_RETARGET_INTERVAL: float = 0.25
 
 func _setup_hooks() -> void:
 	CoopHook.register_replace_or_post(self,
@@ -40,37 +41,44 @@ func _replace_ai_physics_process(delta: float) -> void:
 	if not CoopAuthority.is_host():
 		_client_animate(a, delta)
 		CoopHook.skip_super()
+		return
+	# Multi-player AI retarget: vanilla Sensor + Parameters read
+	# gameData.playerPosition / gameData.cameraPosition (host's view). Swap
+	# them here to nearest puppet so vanilla physics naturally retargets,
+	# restore in _post_ai_physics_process.
+	if a.dead or not a.sensorActive:
+		return
+	if ai == null or not ai.has_method("GetNearestPlayerPosition"):
+		return
+	var t: float = float(a.get_meta("_coop_retarget_t", 0.0)) - delta
+	var pos_cache: Vector3 = a.get_meta("_coop_retarget_pos", Vector3.ZERO)
+	var cam_cache: Vector3 = a.get_meta("_coop_retarget_cam", Vector3.ZERO)
+	if t <= 0.0 or pos_cache == Vector3.ZERO:
+		pos_cache = ai.GetNearestPlayerPosition(a.global_position)
+		cam_cache = ai.GetNearestPlayerCamera(a.global_position)
+		a.set_meta("_coop_retarget_pos", pos_cache)
+		a.set_meta("_coop_retarget_cam", cam_cache)
+		a.set_meta("_coop_retarget_t", COOP_RETARGET_INTERVAL)
+	else:
+		a.set_meta("_coop_retarget_t", t)
+	if pos_cache == Vector3.ZERO:
+		return
+	var gd: Resource = a.gameData
+	a.set_meta("_coop_saved_pp", gd.playerPosition)
+	a.set_meta("_coop_saved_cp", gd.cameraPosition)
+	gd.playerPosition = pos_cache
+	gd.cameraPosition = cam_cache
 
 
-func _post_ai_physics_process(delta: float) -> void:
-	pass
-
-
-# --- this shit destroys FPS ---
-# I assume this is due to the overhead of the hooking?
-# this shit did work, tho.
-# 
-#
-# To enable: register these in _setup_hooks and remove AI_Extend.gd from mod.txt
-#
-# func _on_ai_parameters_pre(delta: float) -> void:
-# 	var a := CoopHook.caller()
-# 	if a == null or not CoopAuthority.is_active() or not CoopAuthority.is_host():
-# 		return
-# 	if a.get_meta("coop_puppet_mode", false) or a.dead:
-# 		return
-# 	if ai and ai.has_method("GetNearestPlayerPosition"):
-# 		a.playerPosition = ai.GetNearestPlayerPosition(a.global_position)
-#
-# func _on_ai_sensor_pre(delta: float) -> void:
-# 	var a := CoopHook.caller()
-# 	if a == null or not CoopAuthority.is_active() or not CoopAuthority.is_host():
-# 		return
-# 	if a.get_meta("coop_puppet_mode", false) or a.dead:
-# 		return
-# 	if ai and ai.has_method("GetNearestPlayerCamera"):
-# 		var nearest_cam: Vector3 = ai.GetNearestPlayerCamera(a.global_position)
-# 		a.gameData.cameraPosition = nearest_cam
+func _post_ai_physics_process(_delta: float) -> void:
+	var a := CoopHook.caller()
+	if a == null or not a.has_meta("_coop_saved_pp"):
+		return
+	var gd: Resource = a.gameData
+	gd.playerPosition = a.get_meta("_coop_saved_pp")
+	gd.cameraPosition = a.get_meta("_coop_saved_cp")
+	a.remove_meta("_coop_saved_pp")
+	a.remove_meta("_coop_saved_cp")
 
 
 func _replace_ai_death(direction, force) -> void:
